@@ -12,27 +12,57 @@
 #include <MNN/Tensor.hpp>
 #include "Tensor_generated.h"
 
-#ifdef CONST
-#undef CONST
-#endif // CONST
+#ifdef CONSTANT
+#undef CONSTANT
+#endif // CONSTANT
 
 namespace MNN {
 class Backend;
-
+struct TensorArrayAttr {
+    // array size is dynamic or not
+    bool isDynamicSize = false;
+    // elemShape is identical or not
+    bool isIdenticalShape = false;
+    // the number of element
+    uint32_t arraySize = 0;
+    // the shape of element
+    std::vector<std::vector<int>> elemShape;
+};
+struct QuantAttr {
+    float scale;
+    float zero = 0.0f;
+    float min  = -128.0f;
+    float max  = 127.0f;
+    DataType type = DataType_DT_INT8;
+};
 /** extra tensor info container */
 struct Tensor::InsideDescribe {
 public:
     /** dimension format */
     MNN_DATA_FORMAT dimensionFormat = MNN_DATA_FORMAT_NC4HW4;
-    /** buffer dimensions pointer holder */
-    halide_dimension_t* dimensionStorage = nullptr;
-    /** handle type */
-    HandleDataType handleType = HANDLE_NONE;
-    /** function used to free handle */
-    void (*handleFreeFunction)(void*) = nullptr;
+    union {
+        /** Serperate memory offset*/
+        int offset;
 
-    /** for HOST tensor only. host memory is owned by tensor or not */
-    bool ownHost = false;
+        /** function used to free handle */
+        void (*handleFreeFunction)(void*);
+    } extra;
+
+    enum MemoryType {
+        /** The tensor's memory come from Backend */
+        MEMORY_BACKEND = 0,
+
+        /** host memory is owned by tensor or not */
+        MEMORY_HOST,
+
+        /** The tensor don't has memory */
+        MEMORY_VIRTUAL,
+
+        /** host memory is owned by tensor or not */
+        MEMORY_OUTSIDE,
+
+    };
+    MemoryType memoryType = MEMORY_BACKEND;
     /** for DEVICE tensor only. backend used to manage tensor's device memory. */
     Backend* backend = nullptr;
     /** for DEVICE tensor only. */
@@ -41,11 +71,30 @@ public:
         NORMAL,
         INPUT,
         OUTPUT,
-        CONST,
+        CONSTANT,
         /** Whether the tensor is a trainable parameter. Trainable parameter should be stored in a different area. */
         TRAINABLE,
     };
     Usage usage = NORMAL;
+    struct View {
+        int32_t offset = 0;
+        int32_t stride[3] = {1, 1, 1};
+    };
+    struct Region {
+        View src;
+        View dst;
+        int32_t size[3] = {1, 1, 1};
+        Tensor* origin;
+        // If offset exist, the tensor dimentsion is 2 x N, first N is srcOffsest, second N is dstOffset
+        // It need copy N region by the offset tensor set
+        Tensor* offset = nullptr;
+    };
+    std::vector<Region> regions;
+    halide_dimension_t dims[MNN_MAX_TENSOR_DIM];
+    // TensorArray Attribute
+    std::shared_ptr<TensorArrayAttr> tensorArrayAttr;
+    // Tensor Quant Attribute
+    std::shared_ptr<QuantAttr> quantAttr;
 };
 typedef Tensor::InsideDescribe::Usage TensorUsage;
 
@@ -94,6 +143,17 @@ public:
      */
     static bool compareTensors(const Tensor* compareTensor, const Tensor* toTensor, float tolerance = 0,
                                bool overall = false, bool printsError = true, bool printsTensors = false);
+
+    static void setupTensorInfo(const Tensor* tensor, Tensor* wrapTensor, MNN_DATA_FORMAT mMidFormat);
+    static Tensor::InsideDescribe::Region makeFullSlice(Tensor* input);
+    static bool regionIsFull(Tensor* input);
+    static bool reshapeSlice(Tensor::InsideDescribe::Region& slice, int outside, int inside, int axis);
+    static bool fuseRegion(Tensor::InsideDescribe::Region& srcReg, Tensor::InsideDescribe::Region& dstReg);
+    static void adjustTensorForCompability(Tensor* t);
+    static Tensor::DimensionType getDimType(const Tensor* t);
+    static halide_type_t DataTypeToHalideType(DataType t);
+    static DataType HaildeTypeToDataType(halide_type_t t);
+    static float getScale(const Tensor* t);
 };
 } // namespace MNN
 

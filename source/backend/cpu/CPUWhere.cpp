@@ -13,36 +13,26 @@ namespace MNN {
 
 ErrorCode CPUWhere::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     auto& ib           = inputs[0]->buffer();
-    auto& ob           = outputs[0]->buffer();
     int32_t* inputData = inputs[0]->host<int32_t>();
     auto outputData    = outputs[0]->host<int32_t>();
+    auto inputTotal = inputs[0]->elementSize();
 
     std::vector<int32_t> trueVec;
-    for (int i = 0; i < ob.dim[0].extent; i++) {
+    for (int i = 0; i < inputTotal; i++) {
         if (inputData[i] > 0) {
             trueVec.push_back(i);
         }
     }
 
-    // ob.dim[0].extent = (int)trueVec.size();
+    //MNN_ASSERT(outputs[0]->batch() == trueVec.size());
     for (int i = 0; i < trueVec.size(); i++) {
         int index = trueVec[i];
         for (int j = 0; j < ib.dimensions; j++) {
-            int result    = index / ib.dim[j].stride;
+            int result    = ib.dim[j].stride == 0 ? index : index / ib.dim[j].stride;
             index         = index - result * ib.dim[j].stride;
             outputData[i * ib.dimensions + j] = result;
         }
     }
-    int defaultValue = 0;
-    if (!trueVec.empty()) {
-        defaultValue = trueVec[0];
-    }
-    for (int i = (int)trueVec.size(); i < ob.dim[0].extent; ++i) {
-        for (int j = 0; j < ib.dimensions; j++) {
-            outputData[i * ib.dimensions + j] = defaultValue;
-        }
-    }
-
     return NO_ERROR;
 }
 

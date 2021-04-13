@@ -24,27 +24,18 @@ CPUUnary::CPUUnary(Backend *b, UnaryOpOperation type) : MNN::Execution(b), mType
 
 ErrorCode CPUUnary::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     MNN_ASSERT(1 == outputs.size());
-    auto dtype = inputs[0]->getType();
-    MNN_ASSERT(dtype == halide_type_of<float>() || dtype == halide_type_of<int32_t>());
+    MNN_ASSERT(inputs[0]->getType() == halide_type_of<float>() || inputs[0]->getType() == halide_type_of<int32_t>());
     return NO_ERROR;
 }
 
 template <typename Func, typename T>
-static ErrorCode _unaryOp(void* inputPtr, void* outputPtr, int elementSize, Backend* bn) {
+static void _unaryOp(void* inputPtr, void* outputPtr, int elementSize) {
     Func f;
-    auto backend = [bn]() {
-        return bn;
-    };
     const T *inputData = (T*)inputPtr;
     T *outputData      = (T *)outputPtr;
-    auto numberThread = ((CPUBackend*)bn)->threadNumber();
-    MNN_CONCURRENCY_BEGIN(tId, numberThread) {
-        for (int i=tId; i<elementSize; i+=numberThread) {
-            outputData[i] = f(inputData[i]);
-        }
+    for (int i=0; i<elementSize; ++i) {
+        outputData[i] = f(inputData[i]);
     }
-    MNN_CONCURRENCY_END();
-    return NO_ERROR;
 }
 
 template <typename T>
@@ -104,13 +95,13 @@ struct UnaryRecipocal : std::unary_function<T, T> {
 template <typename T>
 struct UnaryLog1p : std::unary_function<T, T> {
     T operator()(const T &x) const {
-        return (T)log((T)1 + (x));
+        return (T)logf((T)1 + (x));
     }
 };
 template <typename T>
 struct UnaryLog : std::unary_function<T, T> {
     T operator()(const T &x) const {
-        return (T)log((T)(x));
+        return (T)logf((T)(x));
     }
 };
 template <typename T>
@@ -220,9 +211,9 @@ template <typename T>
 T erfImpl(T x) {
     // Coefficients for by erf(f32), from Cephes. tensorflow
     static const std::vector<float> kErfTCoefficient {
-            +7.853861353153693E-5, -8.010193625184903E-4, +5.188327685732524E-3,
-            -2.685381193529856E-2, +1.128358514861418E-1, -3.761262582423300E-1,
-            +1.128379165726710E+0,
+            +7.853861353153693E-5f, -8.010193625184903E-4f, +5.188327685732524E-3f,
+            -2.685381193529856E-2f, +1.128358514861418E-1f, -3.761262582423300E-1f,
+            +1.128379165726710E+0f,
     };
     return x * evalPoly(x * x, kErfTCoefficient);
 }
@@ -233,15 +224,15 @@ T erfcImpl(T x) {
     const double kMaxlog = 88.72283905206835;
     // erfc(x) = exp(-x^2) P(1/x^2), 1 < x < 2
     static const std::vector<float> kErfcPCoefficient{
-            +2.326819970068386E-2, -1.387039388740657E-1, +3.687424674597105E-1,
-            -5.824733027278666E-1, +6.210004621745983E-1, -4.944515323274145E-1,
-            +3.404879937665872E-1, -2.741127028184656E-1, +5.638259427386472E-1,
+            +2.326819970068386E-2f, -1.387039388740657E-1f, +3.687424674597105E-1f,
+            -5.824733027278666E-1f, +6.210004621745983E-1f, -4.944515323274145E-1f,
+            +3.404879937665872E-1f, -2.741127028184656E-1f, +5.638259427386472E-1f,
     };
     // erfc(x) = exp(-x^2) R(1/x^2), 2 <= x < kMaxlog
     static const std::vector<float> kErfcRCoefficient{
-            -1.047766399936249E+1, +1.297719955372516E+1, -7.495518717768503E+0,
-            +2.921019019210786E+0, -1.015265279202700E+0, +4.218463358204948E-1,
-            -2.820767439740514E-1, +5.641895067754075E-1,
+            -1.047766399936249E+1f, +1.297719955372516E+1f, -7.495518717768503E+0f,
+            +2.921019019210786E+0f, -1.015265279202700E+0f, +4.218463358204948E-1f,
+            -2.820767439740514E-1f, +5.641895067754075E-1f,
     };
     float absX = fabsf(x);
     float z = expf(-x * x);
@@ -362,11 +353,17 @@ ErrorCode CPUUnary::onExecute(const std::vector<Tensor *> &inputs, const std::ve
     if (dtype == halide_type_int) {
         switch (mType) {
             case UnaryOpOperation_ABS:
-                return _unaryOp<UnaryAbs<int32_t>, int32_t>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
+                _unaryOp<UnaryAbs<int32_t>, int32_t>(input->host<void>(), output->host<void>(), input->elementSize());
+                break;
             case UnaryOpOperation_NEG:
-                return _unaryOp<UnaryNeg<int32_t>, int32_t>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
+                _unaryOp<UnaryNeg<int32_t>, int32_t>(input->host<void>(), output->host<void>(), input->elementSize());
+                break;
             case UnaryOpOperation_SQUARE:
-                return _unaryOp<UnarySquare<int32_t>, int32_t>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
+                _unaryOp<UnarySquare<int32_t>, int32_t>(input->host<void>(), output->host<void>(), input->elementSize());
+                break;
+            case UnaryOpOperation_SIGN:
+                _unaryOp<UnarySign<int32_t>, int32_t>(input->host<void>(), output->host<void>(), input->elementSize());
+                break;
             default:
                 MNN_ERROR("Int-Unary not support %d\n", mType);
                 break;
@@ -377,105 +374,126 @@ ErrorCode CPUUnary::onExecute(const std::vector<Tensor *> &inputs, const std::ve
     auto schedule = ((CPUBackend*)backend())->multiThreadDivide(size);
     auto inputPtr = input->host<float>();
     auto outputPtr = output->host<float>();
-    switch (mType) {
-        case UnaryOpOperation_ABS: {
-            MNN_CONCURRENCY_BEGIN(tId, schedule.second) {
-                int start = schedule.first * (int)tId;
-                int realSize = schedule.first;
-                if (tId == schedule.second -1 ) {
-                    realSize = size - start;
-                }
-                if (realSize > 0) {
-                    MNNReluWithSlopeCommon(outputPtr + start, inputPtr + start, realSize, -1.0f);
-                }
-            }
-            MNN_CONCURRENCY_END();
-            return NO_ERROR;
+    auto precision = static_cast<CPUBackend*>(backend())->precisionMode();
+    MNN_CONCURRENCY_BEGIN(tId, schedule.second) {
+        int start = schedule.first * (int)tId;
+        int realSize = schedule.first;
+        if (tId == schedule.second -1 ) {
+            realSize = size - start;
         }
-        case UnaryOpOperation_SQUARE: {
-            MNN_CONCURRENCY_BEGIN(tId, schedule.second) {
-                int start = schedule.first * (int)tId;
-                int realSize = schedule.first;
-                if (tId == schedule.second -1 ) {
-                    realSize = size - start;
-                }
-                if (realSize > 0) {
-                    MNNMatrixProdCommon(outputPtr + start, inputPtr + start, inputPtr + start, realSize, 0, 0, 0, 1);
-                }
+        if (realSize > 0) {
+            auto inp = inputPtr + start;
+            auto out = outputPtr + start;
+            switch (mType) {
+                case UnaryOpOperation_ABS:
+                    MNNReluWithSlopeCommon(out, inp, realSize, -1.0f);
+                    break;
+                case UnaryOpOperation_SQUARE:
+                    MNNMatrixProdCommon(out, inp, inp, realSize, 0, 0, 0, 1);
+                    break;
+                case UnaryOpOperation_NEG:
+                    MNNScaleAndAddBiasScalar(out, inp, 0.0f, -1.0f, realSize);
+                    break;
+                case UnaryOpOperation_RSQRT:
+                    _unaryOp<UnaryRsqrt<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_EXP:
+                    MNNScaleAndAddBiasScalar(out, inp, 0.0f, -1.0f, realSize);
+                    MNNExp(out, out, realSize);
+                    break;
+                case UnaryOpOperation_COS:
+                    _unaryOp<UnaryCos<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_SIN:
+                    MNNSin(out, inp, realSize);
+                    break;
+                case UnaryOpOperation_SIGMOID:
+                    if (BackendConfig::Precision_Low == precision) {
+                        MNNSigmoidLowp(out, inp, realSize);
+                    } else {
+                        MNNSigmoid(out, inp, realSize);
+                    }
+                    break;
+                case UnaryOpOperation_TANH:
+                    MNNTanh(out, inp, realSize);
+                    break;
+                case UnaryOpOperation_TAN:
+                    _unaryOp<UnaryTan<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ATAN:
+                    _unaryOp<UnaryATan<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_SQRT:
+                    _unaryOp<UnarySqrt<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_CEIL:
+                    _unaryOp<UnaryCeil<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_RECIPROCAL:
+                    _unaryOp<UnaryRecipocal<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_LOG1P:
+                    _unaryOp<UnaryLog1p<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_LOG:
+                    _unaryOp<UnaryLog<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_FLOOR:
+                    _unaryOp<UnaryFloor<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_BNLL:
+                    _unaryOp<UnaryBNLL<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ACOSH:
+                    _unaryOp<UnaryAcosh<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_SINH:
+                    _unaryOp<UnarySinh<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ASINH:
+                    _unaryOp<UnaryAsinh<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ATANH:
+                    _unaryOp<UnaryAtanh<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_SIGN:
+                    _unaryOp<UnarySign<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ROUND:
+                    _unaryOp<UnaryRound<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_COSH:
+                    _unaryOp<UnaryCosh<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ERF:
+                    _unaryOp<UnaryErf<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ERFC:
+                    _unaryOp<UnaryErfc<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ERFINV:
+                    _unaryOp<UnaryErfinv<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_EXPM1:
+                    _unaryOp<UnaryExpm1<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ASIN:
+                    _unaryOp<UnaryAsin<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_ACOS:
+                    _unaryOp<UnaryAcos<float>, float>(inp, out, realSize);
+                    break;
+                case UnaryOpOperation_HARDSWISH:
+                    MNNHardSwishCommon(out, inp, realSize);
+                    break;
+                default:
+                    MNN_ASSERT(false);
+                    break;
             }
-            MNN_CONCURRENCY_END();
-            return NO_ERROR;
         }
-        case UnaryOpOperation_RSQRT:
-            return _unaryOp<UnaryRsqrt<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_NEG: {
-            MNN_CONCURRENCY_BEGIN(tId, schedule.second) {
-                int start = schedule.first * (int)tId;
-                int realSize = schedule.first;
-                if (tId == schedule.second -1 ) {
-                    realSize = size - start;
-                }
-                if (realSize > 0) {
-                    MNNScaleAndAddBiasScalar(outputPtr + start, inputPtr + start, 0.0f, -1.0f, realSize);
-                }
-            }
-            MNN_CONCURRENCY_END();
-            return NO_ERROR;
-        }
-        case UnaryOpOperation_EXP:
-            return _unaryOp<UnaryExp<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_COS:
-            return _unaryOp<UnaryCos<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_SIN:
-            return _unaryOp<UnarySin<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_TAN:
-            return _unaryOp<UnaryTan<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ATAN:
-            return _unaryOp<UnaryATan<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_SQRT:
-            return _unaryOp<UnarySqrt<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_CEIL:
-            return _unaryOp<UnaryCeil<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_RECIPROCAL:
-            return _unaryOp<UnaryRecipocal<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_LOG1P:
-            return _unaryOp<UnaryLog1p<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_LOG:
-            return _unaryOp<UnaryLog<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_FLOOR:
-            return _unaryOp<UnaryFloor<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_BNLL:
-            return _unaryOp<UnaryBNLL<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ACOSH:
-            return _unaryOp<UnaryAcosh<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_SINH:
-            return _unaryOp<UnarySinh<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ASINH:
-            return _unaryOp<UnaryAsinh<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ATANH:
-            return _unaryOp<UnaryAtanh<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_SIGN:
-            return _unaryOp<UnarySign<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ROUND:
-            return _unaryOp<UnaryRound<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_COSH:
-            return _unaryOp<UnaryCosh<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ERF:
-            return _unaryOp<UnaryErf<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ERFC:
-            return _unaryOp<UnaryErfc<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ERFINV:
-            return _unaryOp<UnaryErfinv<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_EXPM1:
-            return _unaryOp<UnaryExpm1<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ASIN:
-            return _unaryOp<UnaryAsin<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        case UnaryOpOperation_ACOS:
-            return _unaryOp<UnaryAcos<float>, float>(input->host<void>(), output->host<void>(), input->elementSize(), backend());
-        default:
-            MNN_ASSERT(false);
-            break;
     }
+    MNN_CONCURRENCY_END();
+
 
     return NO_ERROR;
 }

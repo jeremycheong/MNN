@@ -16,8 +16,8 @@ public:
             auto& op           = *iter;
             const auto op_type = op->type;
             auto conv2D        = op->main.AsConvolution2D();
-            auto& common       = conv2D->common;
             if (op_type == MNN::OpType_Convolution || op_type == MNN::OpType_Deconvolution) {
+                auto& common       = conv2D->common;
                 bool turnConv2DW = false;
                 // check whether idst quantization model
                 if (nullptr != conv2D->quanParameter.get()) {
@@ -138,11 +138,11 @@ public:
                 newConvolutionT->common->group       = 1;
                 newConvolutionT->common->padMode     = common->padMode;
                 newConvolutionT->common->outputCount = common->outputCount / common->group;
-                newConvolutionT->common->inputCount = common->inputCount / common->group;
+                newConvolutionT->common->inputCount  = common->inputCount / common->group;
                 newConvolutionT->common->padX        = common->padX;
                 newConvolutionT->common->padY        = common->padY;
                 newConvolutionT->common->relu        = common->relu;
-                newConvolutionT->common->relu6 = common->relu6;
+                newConvolutionT->common->relu6       = common->relu6;
 
                 int startWeight = partWeightSize * i;
                 int startBias   = partBiasSize * i;

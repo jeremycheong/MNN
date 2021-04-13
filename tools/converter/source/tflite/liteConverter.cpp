@@ -92,7 +92,6 @@ static bool needExtractInput(uint32_t opCode) {
     NONEED(tflite::BuiltinOperator_SPLIT);
     NONEED(tflite::BuiltinOperator_CONCATENATION);
     NONEED(tflite::BuiltinOperator_CONV_2D);
-    NONEED(tflite::BuiltinOperator_RESHAPE);
     NONEED(tflite::BuiltinOperator_RESIZE_BILINEAR);
     NONEED(tflite::BuiltinOperator_RESIZE_NEAREST_NEIGHBOR);
     NONEED(tflite::BuiltinOperator_SOFTMAX);
@@ -101,7 +100,8 @@ static bool needExtractInput(uint32_t opCode) {
     return true;
 }
 
-int tflite2MNNNet(const std::string inputModel, const std::string bizCode, std::unique_ptr<MNN::NetT>& MNNNetT) {
+int tflite2MNNNet(const std::string inputModel, const std::string bizCode,
+                  std::unique_ptr<MNN::NetT>& MNNNetT) {
     const std::string model_name = inputModel;
     auto model                   = std::shared_ptr<TfliteModel>(new TfliteModel(model_name));
     model->readModel();
@@ -122,10 +122,15 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode, std::
         for (int j = 0; j < opNums; ++j) {
             const int opcodeIndex = ops[j]->opcode_index;
             const auto opCode     = tfliteOpSet[opcodeIndex]->builtin_code;
-            if (opCode == tflite::BuiltinOperator_CONV_2D || opCode == tflite::BuiltinOperator_DEPTHWISE_CONV_2D) {
+            if (opCode == tflite::BuiltinOperator_CONV_2D || opCode == tflite::BuiltinOperator_DEPTHWISE_CONV_2D ||
+                opCode == tflite::BuiltinOperator_TRANSPOSE_CONV) {
                 const int weightIndex    = ops[j]->inputs[1];
                 const auto& weightTensor = tensors[weightIndex];
                 quantizedModel           = weightTensor->type == tflite::TensorType_UINT8;
+                if(weightTensor->type == tflite::TensorType_INT8){
+                    DLOG(ERROR) << "***MNN DO NOT SUPPORT Tflite [INT8] quantized model, please use MNN quantization tool to quantize model***";
+                    return -1;
+                }
                 if (!quantizedModel)
                     break;
             }

@@ -10,18 +10,22 @@
 #include "backend/cpu/CPUConvolutionDepthwise.hpp"
 #include "backend/cpu/compute/ConvOpt.h"
 #include "backend/cpu/compute/Convolution1x1Strassen.hpp"
-#include "backend/cpu/compute/Convolution3x3.hpp"
 #include "backend/cpu/compute/ConvolutionGroup.hpp"
 #include "backend/cpu/compute/ConvolutionIntFactory.hpp"
 #include "backend/cpu/compute/ConvolutionTiledExecutor.hpp"
 #include "backend/cpu/compute/ConvolutionWinograd.hpp"
 #include "core/Macro.h"
+#include "backend/cpu/OneDNNConvolution.hpp"
+
 namespace MNN {
 
 static Execution* _createUnit(const Tensor* input, const Tensor* output, Backend* backend,
                               const Convolution2DCommon* common, const float* originWeight, size_t originWeightSize,
                               const float* bias, size_t biasSize) {
     auto layer   = common;
+#ifdef MNN_USE_ONEDNN
+    return OneDNN::createConvolution(common, backend, originWeight, originWeightSize, bias, biasSize);
+#endif
     bool fastWay = layer->kernelY() == 1 && layer->kernelX() == 1;
     if (fastWay) {
         return new Convolution1x1Strassen(common, backend, originWeight, originWeightSize, bias, biasSize);
@@ -33,16 +37,10 @@ static Execution* _createUnit(const Tensor* input, const Tensor* output, Backend
     if (cpuBackend->memoryMode() == BackendConfig::Memory_Low) {
         return new ConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize);
     }
-    auto unit = ConvolutionWinograd::bestWinogradUnit(common, input, output, cpuBackend->threadNumber());
+    auto unit = ConvolutionWinograd::bestWinogradUnit(common, input, output, cpuBackend->threadNumber(), backend);
     if (unit <= 1) {
         return new ConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize);
     }
-#if defined(MNN_BUILD_FOR_ANDROID) || defined(__APPLE__)
-    // MNN_PRINT("ic=%d, channel=%d, kx=%d, unit=%d\n", input->channel(), output->channel(), common->kernelX(), unit);
-    if (common->kernelY() == 3 && common->kernelX() == 3 && unit <= 4) {
-        return new Convolution3x3(common, backend, originWeight, originWeightSize, bias, biasSize);
-    }
-#endif
     return new ConvolutionWinograd(common, input, output, backend, originWeight, originWeightSize, bias, biasSize,
                                    unit);
 }
@@ -50,9 +48,17 @@ static Execution* _createUnit(const Tensor* input, const Tensor* output, Backend
 Execution* ConvolutionFloatFactory::create(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                            const MNN::Op* op, Backend* backend) {
     auto conv2d = op->main_as_Convolution2D();
-    if (inputs.size() > 1) {
-        // Use Input Weight and Bias
-        return new ConvolutionTiledExecutorMultiInput(conv2d->common(), backend);
+    if (inputs.empty()) {
+        // Create Default Inputs and Outputs
+        std::shared_ptr<Tensor> tempInput;
+        std::shared_ptr<Tensor> tempOutput;
+        auto common = conv2d->common();
+        int ow = 2, oh = 2;
+        int iw = (common->kernelX() - 1) * common->dilateX() + common->strideX() * (ow - 1) + 1;
+        int ih = (common->kernelY() - 1) * common->dilateY() + common->strideY() * (oh - 1) + 1;
+        tempInput.reset(Tensor::createDevice<float>({1, conv2d->common()->inputCount(), ih, iw}, Tensor::CAFFE_C4));
+        tempOutput.reset(Tensor::createDevice<float>({1, conv2d->common()->outputCount(), oh, ow}, Tensor::CAFFE_C4));
+        return create({tempInput.get()}, {tempOutput.get()}, op, backend);
     }
     const float* originWeight = nullptr;
     size_t originWeightSize   = 0;
@@ -63,7 +69,12 @@ Execution* ConvolutionFloatFactory::create(const std::vector<Tensor*>& inputs, c
             MNN_ERROR("Memory not Enough, can't extract IDST Convolution: %s \n", op->name()->c_str());
             return nullptr;
         }
+
         if (quanCommon->weightFloat.get() == nullptr) {
+            if (backend->type() != MNN_FORWARD_CPU) {
+                // From BF16
+                return nullptr;
+            }
             return ConvolutionIntFactory::create(inputs[0], outputs[0], op, backend, quanCommon.get());
         }
         // Back to float
@@ -79,13 +90,17 @@ Execution* ConvolutionFloatFactory::create(const std::vector<Tensor*>& inputs, c
         originWeightSize = op->main_as_Convolution2D()->weight()->size();
     }
 
-    if (1 == common->group()) {
+    int group            = common->group();
+    if (common->inputCount() != inputs[0]->channel() && common->inputCount() > 0) {
+        group = inputs[0]->channel()/ conv2d->common()->inputCount();
+    }
+    if (1 == group) {
         return _createUnit(inputs[0], outputs[0], backend, common, originWeight, originWeightSize,
                            conv2d->bias()->data(), conv2d->bias()->size());
     }
+    // TODO: Use Geometry to split
     // Split
     std::vector<std::shared_ptr<Execution>> subConvolution;
-    auto group            = common->group();
     auto groupOutputCount = common->outputCount() / group;
     auto groupWeightSize  = originWeightSize / group;
     std::shared_ptr<Tensor> emptyInput(Tensor::createDevice<float>(inputs[0]->shape(), Tensor::CAFFE));
@@ -100,5 +115,4 @@ Execution* ConvolutionFloatFactory::create(const std::vector<Tensor*>& inputs, c
     }
     return new ConvolutionGroup(backend, subConvolution);
 }
-
 } // namespace MNN

@@ -7,34 +7,48 @@
 //
 
 #include <math.h>
-#include "core/SizeComputer.hpp"
+#include "shape/SizeComputer.hpp"
 #include "core/TensorUtils.hpp"
 namespace MNN {
 class ConvolutionSizeComputer : public SizeComputer {
 public:
+    static const Convolution2DCommon* loadCommon(const Op* op) {
+        const Convolution2DCommon* layer = nullptr;
+        if (op->main_type() == OpParameter_Convolution2D) {
+            layer = op->main_as_Convolution2D()->common();
+        } else {
+            MNN_ASSERT(op->main_type() == OpParameter_TfQuantizedConv2D);
+            layer = op->main_as_TfQuantizedConv2D()->common();
+        }
+        return layer;
+    }
     virtual bool onComputeSize(const MNN::Op* op, const std::vector<Tensor*>& inputs,
                                const std::vector<Tensor*>& outputs) const override {
         MNN_ASSERT(inputs.size() >= 1);
         MNN_ASSERT(1 == outputs.size());
-        auto format = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
-        if (format != MNN_DATA_FORMAT_NC4HW4) {
-            return false;
+        const Convolution2DCommon* layer = loadCommon(op);
+        int kX = layer->kernelX();
+        int kY = layer->kernelY();
+        auto outputCount = layer->outputCount();
+        if (inputs.size() > 1 && outputCount == 0) {
+            // From TF's multi input convolution
+            outputCount = inputs[1]->length(0);
+            kX = inputs[1]->length(3);
+            kY = inputs[1]->length(2);
         }
-        auto layer        = op->main_as_Convolution2D()->common();
-        int kernel_width  = layer->dilateX() * (layer->kernelX() - 1) + 1;
-        int kernel_height = layer->dilateY() * (layer->kernelY() - 1) + 1;
+        int kernel_width  = layer->dilateX() * (kX - 1) + 1;
+        int kernel_height = layer->dilateY() * (kY - 1) + 1;
 
         int output_width  = 1;
         int output_height = 1;
 
         auto input = inputs[0];
-        if (input->buffer().dimensions < 4) {
+        if (input->dimensions() <= 1) {
+            // Convolution is not valid for dimension <= 1
             return false;
         }
-        if (input->width() <= 0 || input->height() <= 0) {
-            return false;
-        }
-        if (layer->inputCount() > 0 && input->channel() != layer->inputCount() && OpType_Convolution == op->type()) {
+        // For Tensorflow Group Convolution, the inputCount is the size of filter's input count
+        if (layer->inputCount() > 0 && input->channel() % layer->inputCount() != 0 && OpType_Convolution == op->type()) {
             MNN_ERROR("Error for compute convolution shape, need channel = %d, input channel = %d\n", layer->inputCount(), input->channel());
             return false;
         }
@@ -53,8 +67,8 @@ public:
                 MNN_ASSERT(layer->pads()->size() >= 4);
                 int input_width  = input->width() + layer->pads()->data()[1] + layer->pads()->data()[3];
                 int input_height = input->height() + layer->pads()->data()[0] + layer->pads()->data()[2];
-                output_width     = (input_width - kernel_width) / layer->strideX() + 1;
-                output_height    = (input_height - kernel_height) / layer->strideY() + 1;
+                output_width     = input_width < kernel_width ? 0 : (input_width - kernel_width) / layer->strideX() + 1;
+                output_height    = input_height < kernel_height ? 0 : (input_height - kernel_height) / layer->strideY() + 1;
             } else {
                 int input_width  = input->width() + layer->padX() * 2;
                 int input_height = input->height() + layer->padY() * 2;
@@ -65,28 +79,38 @@ public:
 
         auto& outputBuffer         = outputs[0]->buffer();
         outputBuffer.dimensions    = input->buffer().dimensions;
-        outputBuffer.dim[0].extent = input->buffer().dim[0].extent;
-
-        outputBuffer.dim[1].extent = layer->outputCount();
-        outputBuffer.dim[2].extent = output_height;
-        outputBuffer.dim[3].extent = output_width;
+        auto format = TensorUtils::getDescribe(input)->dimensionFormat;
         outputBuffer.type = input->getType();
+        outputBuffer.dim[0].extent = input->buffer().dim[0].extent;
+        if (MNN_DATA_FORMAT_NHWC == format) {
+            outputBuffer.dim[3].extent = outputCount;
+            outputBuffer.dim[1].extent = output_height;
+            outputBuffer.dim[2].extent = output_width;
+        } else {
+            outputBuffer.dim[1].extent = outputCount;
+            outputBuffer.dim[2].extent = output_height;
+            outputBuffer.dim[3].extent = output_width;
+        }
         //MNN_PRINT("%d, %d, %d, %d\n", outputs[0]->length(0), outputs[0]->length(1), outputs[0]->length(2), outputs[0]->length(3));
-
         TensorUtils::getDescribe(outputs[0])->dimensionFormat = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
         return true;
     }
 
     virtual float onComputeFlops(const MNN::Op* op, const std::vector<Tensor*>& inputs,
                                  const std::vector<Tensor*>& outputs) const override {
-        auto layer = op->main_as_Convolution2D()->common();
+        const Convolution2DCommon* layer = loadCommon(op);
         auto kw    = layer->kernelX();
         auto kh    = layer->kernelY();
         auto group = layer->group();
         auto ic    = inputs[0]->channel();
         auto oc    = outputs[0]->channel();
         auto oSize = outputs[0]->width() * outputs[0]->height() * outputs[0]->batch();
-
+        if (op->type() == OpType_QuantizedDepthwiseConv2D) {
+            group = ic;
+        }
+        if (layer->inputCount() != ic && layer->inputCount() > 0) {
+            group = ic / layer->inputCount();
+        }
         auto flops = (float)oSize * kw * kh * (ic * oc / group) / FLOPS_M;
         return flops;
     }
@@ -127,6 +151,8 @@ public:
 
 REGISTER_SHAPE(ConvolutionSizeComputer, OpType_Convolution);
 REGISTER_SHAPE(ConvolutionSizeComputer, OpType_ConvolutionDepthwise);
+REGISTER_SHAPE(ConvolutionSizeComputer, OpType_TfQuantizedConv2D);
+REGISTER_SHAPE(ConvolutionSizeComputer, OpType_QuantizedDepthwiseConv2D);
 REGISTER_SHAPE(ConvolutionSizeComputer, OpType_ConvInt8);
 REGISTER_SHAPE(ConvolutionSizeComputer, OpType_DepthwiseConvInt8);
 REGISTER_SHAPE(Dilation2DSizeComputer, OpType_Dilation2D);

@@ -2,9 +2,23 @@
 # Created by ruhuan on 2019.08.31
 """ setup tool """
 from __future__ import print_function
-import os
+
 import sys
+import argparse
+parser = argparse.ArgumentParser(description='build pymnn wheel')
+parser.add_argument('--x86', dest='x86', action='store_true', default=False,
+                    help='build wheel for 32bit arch, only usable on windows')
+parser.add_argument('--version', dest='version', type=str, required=True,
+                    help='MNN dist version')
+args, unknown = parser.parse_known_args()
+sys.argv = [sys.argv[0]] + unknown
+
+import os
 import platform
+try:
+   import numpy as np
+except:
+   print("import numpy failed")
 from setuptools import setup, Extension, find_packages
 from distutils import core
 from distutils.core import Distribution
@@ -14,7 +28,10 @@ IS_DARWIN = (platform.system() == 'Darwin')
 IS_LINUX = (platform.system() == 'Linux')
 BUILD_DIR = 'pymnn_build'
 BUILD_TYPE = 'RELEASE'
-BUILD_ARCH = 'x64' # x64 or x86
+BUILD_ARCH = 'x64'
+if args.x86:
+    BUILD_ARCH = ''
+
 def check_env_flag(name, default=''):
     """ check whether a env is set to Yes """
     return os.getenv(name, default).upper() in ['ON', '1', 'YES', 'TRUE', 'Y']
@@ -23,10 +40,27 @@ def report(*args):
     """ print information """
     print(*args)
 
-package_name = os.getenv('MNN_PACKAGE_NAME', 'MNN')
-version = '0.0.9'
-depend_pip_packages = ['flatbuffers', 'pydot_ng', 'graphviz']
-README = os.path.join(os.getcwd(), "README.md")
+package_name = 'MNN'
+USE_TRT=check_env_flag('USE_TRT')
+
+print ("USE_TRT ", USE_TRT)
+
+if os.path.isdir('../../schema/private'):
+    if USE_TRT:
+        print("Build Internal NNN with TRT")
+        package_name = 'MNN_Internal_TRT'
+    else:
+        print("Build Internal NNN")
+        package_name = 'MNN_Internal'
+
+print ('Building with python wheel with package name ', package_name)
+
+version = args.version
+depend_pip_packages = ['flatbuffers', 'numpy']
+if package_name == 'MNN':
+    README = os.path.join(os.getcwd(), "README.md")
+else:
+    README = os.path.join(os.getcwd(), "README_Internal.md")
 with open(README) as f:
     long_description = f.read()
 
@@ -57,9 +91,6 @@ def configure_extension_build():
                               '/wd4267', '/wd4251', '/wd4522', '/wd4522', '/wd4838',
                               '/wd4305', '/wd4244', '/wd4190', '/wd4101', '/wd4996',
                               '/wd4275']
-        if sys.version_info[0] == 2:
-            report('Can not support MNN with Python 2.7 on Windows.')
-            sys.exit(1)
     else:
         extra_link_args = []
         extra_compile_args = [
@@ -84,15 +115,22 @@ def configure_extension_build():
         ]
         if check_env_flag('WERROR'):
             extra_compile_args.append('-Werror')
+    extra_compile_args += ['-DPYMNN_EXPR_API', '-DPYMNN_NUMPY_USABLE']
     root_dir = os.getenv('PROJECT_ROOT', os.path.dirname(os.path.dirname(os.getcwd())))
-    engine_compile_args = ['-DBUILD_OPTYPE', '-DBUILD_TRAIN']
+    engine_compile_args = ['-DBUILD_OPTYPE', '-DPYMNN_TRAIN_API']
     engine_libraries = []
     engine_library_dirs = [os.path.join(root_dir, BUILD_DIR)]
     engine_library_dirs += [os.path.join(root_dir, BUILD_DIR, "tools", "train")]
+    engine_library_dirs += [os.path.join(root_dir, BUILD_DIR, "source", "backend", "tensorrt")]
+    if USE_TRT:
+        # Note: TensorRT-5.1.5.0/lib should be set in $LIBRARY_PATH of the build system.
+        engine_library_dirs += ['/usr/local/cuda/lib64/']
+
     engine_link_args = []
     engine_sources = [os.path.join(root_dir, "pymnn", "src", "MNN.cc")]
     engine_include_dirs = [os.path.join(root_dir, "include")]
     engine_include_dirs += [os.path.join(root_dir, "express")]
+    engine_include_dirs += [os.path.join(root_dir, "express", "module")]
     engine_include_dirs += [os.path.join(root_dir, "source")]
     engine_include_dirs += [os.path.join(root_dir, "tools", "train", "source", "grad")]
     engine_include_dirs += [os.path.join(root_dir, "tools", "train", "source", "module")]
@@ -104,12 +142,23 @@ def configure_extension_build():
     engine_include_dirs += [os.path.join(root_dir, "schema", "current")]
     engine_include_dirs += [os.path.join(root_dir, "3rd_party",\
                                           "flatbuffers", "include")]
-    engine_depend = ['-lMNN', '-lMNNTrain']
+    engine_include_dirs += [np.get_include()]
+
+    trt_depend = ['-lTRT_CUDA_PLUGIN', '-lnvinfer', '-lnvparsers', '-lnvinfer_plugin', '-lcudart']
+    engine_depend = ['-lMNN', '-lz']
+    if USE_TRT:
+        engine_depend += trt_depend
 
     tools_compile_args = []
     tools_libraries = []
     tools_library_dirs = [os.path.join(root_dir, BUILD_DIR)]
     tools_library_dirs += [os.path.join(root_dir, BUILD_DIR, "tools", "converter")]
+    tools_library_dirs += [os.path.join(root_dir, BUILD_DIR, "source", "backend", "tensorrt")]
+
+    if USE_TRT:
+        # Note: TensorRT-5.1.5.0/lib should be set in $LIBRARY_PATH of the build system.
+        tools_library_dirs += ['/usr/local/cuda/lib64/']
+
     tools_link_args = []
     tools_sources = [os.path.join(root_dir, "pymnn", "src", "MNNTools.cc")]
     tools_sources += [os.path.join(root_dir, "tools", "quantization",\
@@ -119,8 +168,7 @@ def configure_extension_build():
     tools_sources += [os.path.join(root_dir, "tools", "quantization",\
                                      "quantizeWeight.cpp")]
     tools_sources += [os.path.join(root_dir, "tools", "quantization", "Helper.cpp")]
-    tools_include_dirs = [os.path.join(root_dir, "tools", "converter",\
-                                       "source", "IR")]
+    tools_include_dirs = []
     tools_include_dirs += [os.path.join(root_dir, "tools", "converter",\
                                        "include")]
     tools_include_dirs += [os.path.join(root_dir, "tools", "converter",\
@@ -137,7 +185,15 @@ def configure_extension_build():
     tools_include_dirs += [os.path.join(root_dir, "source", "core")]
     tools_include_dirs += [os.path.join(root_dir, "schema", "current")]
     tools_include_dirs += [os.path.join(root_dir, "source")]
-    tools_depend = ['-lMNN', '-lMNNConvertDeps']
+    tools_include_dirs += [np.get_include()]
+    if IS_WINDOWS:
+        tools_include_dirs += [os.path.join(os.environ['Protobuf_SRC_ROOT_FOLDER'], 'src')]
+
+    tools_depend = ['-lMNN', '-lMNNConvertDeps', '-lz']
+
+    if USE_TRT:
+        tools_depend += trt_depend
+
     engine_extra_link_args = []
     tools_extra_link_args = []
     if IS_DARWIN:
@@ -151,7 +207,6 @@ def configure_extension_build():
         engine_extra_link_args += ['-Wl,--no-whole-archive']
     if IS_WINDOWS:
         engine_extra_link_args += ['/WHOLEARCHIVE:MNN.lib']
-        engine_extra_link_args += ['/WHOLEARCHIVE:MNNTrain.lib']
     if IS_DARWIN:
         tools_extra_link_args += ['-Wl,-all_load']
         tools_extra_link_args += tools_depend
@@ -161,7 +216,7 @@ def configure_extension_build():
         tools_extra_link_args += ['-Wl,--whole-archive']
         tools_extra_link_args += tools_depend
         tools_extra_link_args += ['-fopenmp']
-        tools_extra_link_args += ['-l:libprotobuf.a']
+        tools_extra_link_args += ['/usr/local/lib/libprotobuf.a']
         tools_extra_link_args += ['-Wl,--no-whole-archive']
         tools_extra_link_args += ['-lz']
     if IS_WINDOWS:
@@ -226,7 +281,6 @@ def configure_extension_build():
         'console_scripts': [
             'mnnconvert = MNN.tools.mnnconvert:main',
             'mnnquant = MNN.tools.mnnquant:main',
-            'mnnvisual = MNN.tools.mnnvisual:main',
             'mnnops = MNN.tools.mnnops:main',
             'mnn = MNN.tools.mnn:main'
         ]
@@ -272,7 +326,7 @@ if __name__ == '__main__':
         entry_points=entry_points,
         install_requires=depend_pip_packages,
         url='https://www.yuque.com/mnn/en/usage_in_python',
-        download_url='https://github.com/MNN',
+        download_url='https://github.com/alibaba/MNN',
         author='alibaba MNN Team',
         author_email='lichuan.wlc@alibaba-inc.com',
         python_requires='>=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*',

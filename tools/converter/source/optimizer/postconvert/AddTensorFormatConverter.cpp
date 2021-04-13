@@ -7,8 +7,12 @@
 //
 
 #include "../PostTreatUtils.hpp"
+#include "../../common/Global.hpp"
+#include "config.hpp"
+
 using namespace MNN;
 const std::set<MNN::OpType> NC4HW4_OPs = {
+    MNN::OpType_ConvInt8,
     MNN::OpType_Convolution,
     MNN::OpType_Convolution3D,
     MNN::OpType_ConvolutionDepthwise,
@@ -16,7 +20,6 @@ const std::set<MNN::OpType> NC4HW4_OPs = {
     MNN::OpType_Pooling3D,
     MNN::OpType_ROIPooling,
     MNN::OpType_Resize,
-    MNN::OpType_LSTM,
     MNN::OpType_SpatialProduct,
     MNN::OpType_Deconvolution,
     MNN::OpType_DeconvolutionDepthwise,
@@ -29,21 +32,45 @@ const std::set<MNN::OpType> NC4HW4_OPs = {
     MNN::OpType_Scale,
     MNN::OpType_TfQuantizedConv2D,
     MNN::OpType_QuantizedDepthwiseConv2D,
-    MNN::OpType_BatchToSpaceND,
     MNN::OpType_BatchNorm,
-    MNN::OpType_SpaceToBatchND,
     MNN::OpType_InstanceNorm,
     MNN::OpType_Moments,
     MNN::OpType_QuantizedAvgPool,
     MNN::OpType_QuantizedAdd,
     MNN::OpType_PReLU,
     MNN::OpType_Dilation2D,
+    MNN::OpType_Int8ToFloat,
+    MNN::OpType_FloatToInt8,
+    MNN::OpType_ConvInt8,
+    MNN::OpType_DepthwiseConvInt8,
+    MNN::OpType_GridSample,
 };
-const std::set<MNN::OpType> COMPABILITY_OPs = {MNN::OpType_ReLU,          MNN::OpType_ReLU6,   MNN::OpType_Concat,
-                                               MNN::OpType_Slice,         MNN::OpType_Permute, MNN::OpType_Selu,
-                                               MNN::OpType_ConvertTensor, MNN::OpType_Sigmoid, MNN::OpType_Cast,
-                                               MNN::OpType_Reshape,       MNN::OpType_TanH, MNN::OpType_Eltwise,    MNN::OpType_Padding, MNN::OpType_ELU, MNN::OpType_Dropout};
+const std::set<MNN::OpType> COMPABILITY_OPs = {
+    MNN::OpType_ReLU,    MNN::OpType_ReLU6,          MNN::OpType_Concat,         MNN::OpType_Slice,
+    MNN::OpType_Permute, MNN::OpType_Selu,           MNN::OpType_ConvertTensor,  MNN::OpType_Sigmoid,
+    MNN::OpType_Cast,    MNN::OpType_BatchToSpaceND, MNN::OpType_SpaceToBatchND, MNN::OpType_Reshape,
+    MNN::OpType_TanH,    MNN::OpType_Eltwise,        MNN::OpType_Padding,        MNN::OpType_ELU,
+    MNN::OpType_Dropout, MNN::OpType_UnaryOp,        MNN::OpType_DepthToSpace,   MNN::OpType_SpaceToDepth,
+};
 
+const std::set<MNN::OpType> COMPABILITY_NCHW_OPs = {
+    MNN::OpType_Transpose,
+    MNN::OpType_StridedSlice,
+    MNN::OpType_SliceTf,
+    MNN::OpType_Unsqueeze,
+    MNN::OpType_Squeeze,
+    MNN::OpType_Crop,
+    MNN::OpType_Tile,
+    MNN::OpType_Pack,
+    MNN::OpType_Unpack,
+    MNN::OpType_Fill,
+    MNN::OpType_BroadcastTo,
+    MNN::OpType_Padding,
+    MNN::OpType_Flatten,
+    MNN::OpType_ExpandDims,
+    MNN::OpType_ReverseSequence,
+    MNN::OpType_BinaryOp,
+};
 static bool _OpNeedConvertContent(OpType type, int index) {
     switch (type) {
         case OpType_Shape:
@@ -58,6 +85,7 @@ static bool _OpNeedConvertContent(OpType type, int index) {
         case OpType_Interp:
         case OpType_Crop:
         case OpType_Reshape:
+        case OpType_GridSample:
         case OpType_Resize:
         case OpType_Padding:
             if (1 <= index) {
@@ -69,11 +97,24 @@ static bool _OpNeedConvertContent(OpType type, int index) {
     }
     return true;
 }
+
+static bool isCompabilityOp(OpType type, MNN_DATA_FORMAT originTensorType, float version) {
+    if (COMPABILITY_OPs.find(type) != COMPABILITY_OPs.end()) {
+        return true;
+    }
+    if (version < 1.1f || originTensorType != MNN_DATA_FORMAT_NCHW) {
+        return false;
+    }
+    if (version < 1.2f && type == OpType_BinaryOp) {
+        return false;
+    }
+    return COMPABILITY_NCHW_OPs.find(type) != COMPABILITY_NCHW_OPs.end();
+}
 class AddTensorFormatConverter : public PostConverter {
 public:
     virtual bool onExecute(std::unique_ptr<MNN::NetT>& net) const override {
         auto& mNet = net;
-        if (mNet->sourceType == MNN::NetSource_CAFFE || mNet->sourceType == MNN::NetSource_ONNX) {
+        if (mNet->sourceType == MNN::NetSource_CAFFE) {
             return true;
         }
 
@@ -81,11 +122,14 @@ public:
         if (mNet->sourceType == MNN::NetSource_ONNX) {
             originTensorType = MNN::MNN_DATA_FORMAT_NCHW;
         }
+        auto config = Global<modelConfig>::Get();
+        auto version = config->targetVersion;
 
         // set the layout of every tensor
         // Don't support inplace
         std::map<int, MNN::MNN_DATA_FORMAT> tensorType;
         std::map<std::string, MNN::MNN_DATA_FORMAT> opType;
+        std::map<int, int> convertMap;
         for (auto& iter : mNet->oplists) {
             // set output tensor layout of this op according to context
             auto type = originTensorType;
@@ -93,7 +137,7 @@ public:
                 type = iter->main.AsTensorConvertInfo()->dest;
             } else if (NC4HW4_OPs.find(iter->type) != NC4HW4_OPs.end()) {
                 type = MNN::MNN_DATA_FORMAT_NC4HW4;
-            } else if (COMPABILITY_OPs.find(iter->type) != COMPABILITY_OPs.end()) {
+            } else if (isCompabilityOp(iter->type, originTensorType, version)) {
                 int nc4hw4TypeNumber = 0; // NC4HW4 number
                 int originTypeNumber = 0;
                 for (int i = 0; i < iter->inputIndexes.size(); ++i) {
@@ -121,6 +165,33 @@ public:
             }
             opType.insert(std::make_pair(iter->name, type));
         }
+
+        // Replace the unused tensor convert op by an Identity op, then the
+        // Identity op should be removed from the net later.
+        for (int i = 0; i < mNet->oplists.size(); ++i) {
+            const auto& op = mNet->oplists[i];
+            if (op->type != MNN::OpType_ConvertTensor) {
+                continue;
+            }
+            auto layout = opType.at(op->name);
+            // TensorConvert only has one input.
+            int input_index   = op->inputIndexes.at(0);
+            auto input_layout = tensorType.at(input_index);
+            if (layout == input_layout) {
+                auto* identity   = new MNN::ExtraT;
+                identity->type   = "Identity";
+                identity->engine = "Tensorflow";
+                std::unique_ptr<MNN::OpT> identity_op(new MNN::OpT);
+                identity_op->name                   = op->name;
+                identity_op->type                   = OpType_Extra;
+                identity_op->main.type              = OpParameter_Extra;
+                identity_op->main.value             = identity;
+                identity_op->inputIndexes           = op->inputIndexes;
+                identity_op->outputIndexes          = op->outputIndexes;
+                identity_op->defaultDimentionFormat = op->defaultDimentionFormat;
+                mNet->oplists[i].reset(identity_op.release());
+            }
+        }
         for (auto iter = mNet->oplists.begin(); iter != mNet->oplists.end();) {
             auto op = iter->get();
             // Insert Pretreat Op if needed
@@ -131,12 +202,12 @@ public:
             if (op->type == OpType_Padding) {
                 DCHECK(op->inputIndexes.size() == 2) << "Padding should have 2 inputs";
                 const int padValueIndex = op->inputIndexes[1];
-                auto padValueOp = PostTreatUtils::_findOpByOutputIndex(padValueIndex, mNet.get());
-                if(opType.find(padValueOp->name)->second == MNN::MNN_DATA_FORMAT_NCHW){
+                auto padValueOp         = PostTreatUtils::_findOpByOutputIndex(padValueIndex, mNet.get());
+                if (opType.find(padValueOp->name)->second == MNN::MNN_DATA_FORMAT_NCHW) {
                     iter++;
                     continue;
                 }
-                
+
                 // Add Gather op for padding, turn nhwc -> nchw
                 std::unique_ptr<OpT> gatherIndex(new OpT);
                 gatherIndex->outputIndexes = {(int)mNet->tensorName.size()};
@@ -201,6 +272,10 @@ public:
                 if (!_OpNeedConvertContent(op->type, i)) {
                     continue;
                 }
+                if (convertMap.find(op->inputIndexes[i]) != convertMap.end()) {
+                    op->inputIndexes[i] = convertMap[op->inputIndexes[i]];
+                    continue;
+                }
 
                 // Insert Transform op
                 MNN::OpT* transformOp = new MNN::OpT;
@@ -215,7 +290,7 @@ public:
                 // op->name.c_str(), i);
                 transformOp->inputIndexes.push_back(inputIndex);
                 transformOp->outputIndexes.push_back(mNet->tensorName.size());
-
+                convertMap[inputIndex] = transformOp->outputIndexes[0];
                 mNet->tensorName.push_back(transformOp->name);
                 op->inputIndexes[i] = transformOp->outputIndexes[0];
                 transformOp->type   = MNN::OpType_ConvertTensor;
@@ -243,7 +318,7 @@ public:
                 continue;
             }
             if (MNN::OpType_Input == op->type) {
-                auto input = op->main.AsInput();
+                auto input        = op->main.AsInput();
                 const int dimSize = input->dims.size();
                 if (dimSize > 2) {
                     const int channel = input->dims[dimSize - 1];

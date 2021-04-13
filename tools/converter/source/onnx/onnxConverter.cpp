@@ -20,7 +20,8 @@
 #include "onnxConverter.hpp"
 #include "onnxOpConverter.hpp"
 
-int onnx2MNNNet(const std::string inputModel, const std::string bizCode, std::unique_ptr<MNN::NetT>& netT) {
+int onnx2MNNNet(const std::string inputModel, const std::string bizCode,
+                std::unique_ptr<MNN::NetT>& netT) {
     onnx::ModelProto onnxModel;
     // read ONNX Model
     bool success = onnx_read_proto_from_binary(inputModel.c_str(), &onnxModel);

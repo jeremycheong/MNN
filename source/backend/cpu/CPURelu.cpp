@@ -18,12 +18,36 @@ ErrorCode CPURelu::onExecute(const std::vector<Tensor*>& inputs, const std::vect
     auto& ib = inputs[0]->buffer();
     auto& ob = outputs[0]->buffer();
 
+    if (inputs[0]->getType() == halide_type_of<int8_t>()) {
+        const int8_t* srcO = (const int8_t*)ib.host;
+        int8_t* dstO       = (int8_t*)ob.host;
+        auto size         = inputs[0]->size() / sizeof(int8_t);
+        auto numberThread = ((CPUBackend*)backend())->threadNumber();
+        int sizeQuad     = size / 16;
+        int remain       = sizeQuad * 16;
+        int sizeDivide = sizeQuad / numberThread;
+        if (sizeQuad > 0) {
+            MNN_CONCURRENCY_BEGIN(tId, numberThread) {
+                int number = sizeDivide;
+                if (tId == numberThread - 1) {
+                    number = sizeQuad - tId * sizeDivide;
+                }
+                MNNReluInt8(dstO + 16 * tId * sizeDivide, srcO + 16 * tId * sizeDivide, number * 16);
+            }
+            MNN_CONCURRENCY_END();
+        }
+        for (int i = remain; i < size; i++) {
+            dstO[i] = srcO[i] > 0 ? srcO[i] : 0;
+        }
+        return NO_ERROR;
+    }
+
     const float* srcO = (const float*)ib.host;
     float* dstO       = (float*)ob.host;
     auto size         = inputs[0]->size() / sizeof(float);
     auto numberThread = ((CPUBackend*)backend())->threadNumber();
-    auto sizeQuad     = size / 4;
-    auto remain       = sizeQuad * 4;
+    int sizeQuad     = size / 4;
+    int remain       = sizeQuad * 4;
     int sizeDivide = sizeQuad / numberThread;
     if (sizeQuad > 0) {
         MNN_CONCURRENCY_BEGIN(tId, numberThread) {
@@ -56,18 +80,16 @@ ErrorCode CPURelu6::onExecute(const std::vector<Tensor*>& inputs, const std::vec
     auto sizeQuad     = size / 4;
     auto remain       = sizeQuad * 4;
     int sizeDivide = sizeQuad / numberThread;
-
     std::vector<float> bias = {0.0f, 0.0f, 0.0f, 0.0f};
     MNN_CONCURRENCY_BEGIN(tId, numberThread) {
         int number = sizeDivide;
         if (tId == numberThread - 1) {
             number = sizeQuad - tId * sizeDivide;
         }
-        ::memcpy(dstO + tId * sizeDivide * 4, srcO + tId * sizeDivide * 4, number * 4 * sizeof(float));
-        MNNAddBiasRelu6(dstO + tId * sizeDivide * 4, bias.data(), number, 1);
+        MNNAxByClampBroadcastUnit(dstO + tId * sizeDivide * 4, srcO + tId * sizeDivide * 4, bias.data(), number, 0, 0, 1, mParam.data());
     }
     MNN_CONCURRENCY_END();
-    MNNRelu6(dstO + remain, srcO + remain, size - remain);
+    MNNAxByClamp(dstO + remain, srcO + remain, srcO + remain, size - remain, 0, 0, 0, 1, mParam.data());
     return NO_ERROR;
 }
 
@@ -81,14 +103,15 @@ CPUPRelu::CPUPRelu(Backend* b, const Op* op) : MNN::Execution(b) {
 ErrorCode CPUPRelu::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     auto& ib            = inputs[0]->buffer();
     auto& ob            = outputs[0]->buffer();
-    const int width     = ib.dim[3].extent;
-    const int height    = ib.dim[2].extent;
+    int sizeQuad = 1;
+    for (int i=2; i<ib.dimensions; ++i) {
+        sizeQuad *= ib.dim[i].extent;
+    }
     const int channel   = ib.dim[1].extent;
     const int batch     = ib.dim[0].extent;
     const int depthQuad = UP_DIV(channel, 4);
     const float* srcO   = (const float*)ib.host;
     float* dstO         = (float*)ob.host;
-    int sizeQuad        = width * height;
     auto totalCount = batch * depthQuad;
     auto numberThread = ((CPUBackend*)backend())->threadNumber();
     MNN_CONCURRENCY_BEGIN(tId, numberThread) {
@@ -124,7 +147,14 @@ class CPURelu6Creator : public CPUBackend::Creator {
 public:
     virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                 const MNN::Op* op, Backend* backend) const {
-        return new CPURelu6(backend);
+        float minV = 0.0f;
+        float maxV = 6.0f;
+        if (nullptr != op->main()) {
+            auto p = op->main_as_Relu6();
+            minV = p->minValue();
+            maxV = p->maxValue();
+        }
+        return new CPURelu6(maxV, minV, backend);
     }
 };
 

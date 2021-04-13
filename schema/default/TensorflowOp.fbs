@@ -137,6 +137,9 @@ enum UnaryOpOperation : int {
     ERFC = 26,
     ERFINV = 27,
     EXPM1 = 28,
+    SIGMOID = 29,
+    TANH = 30,
+    HARDSWISH = 31,
 }
 
 table UnaryOp {
@@ -239,9 +242,15 @@ table BatchMatMulParam {
     adjY: bool = false;
 }
 
+enum DepthToSpaceMode : byte {
+    DCR = 0,
+    CRD = 1
+}
+
 // DepthToSpace and SpaceToDepth using the same parameter
 table DepthSpaceParam {
     blockSize: int;
+    mode: DepthToSpaceMode = DCR;
 }
 
 table ReverseSequenceParam {
@@ -275,4 +284,30 @@ enum PadValueMode : byte{
 
 table PadParam{
     mode: PadValueMode = CONSTANT;
+}
+table LayerNorm {
+    axis: [int];
+    epsilon: float;
+    gamma: [float];
+    beta: [float];
+}
+table RandomUniform {
+    seed:int = 0;
+    seed2:int = 0;
+    type:DataType = DT_FLOAT;
+    T:DataType = DT_INT32;
+}
+table TensorArray {
+    // false - fix array size; true - dynamic array size;
+    dynamic_size:bool = false;
+    // false - element dynamic shape; true - element identical shape;
+    identical_element_shapes:bool = false;
+    element_shape:[int];
+    T:DataType = DT_FLOAT;
+}
+
+table LSTMBlockCell {
+    cell_clip:float = 3.0;
+    forget_bias:float = 1.0;
+    use_peephole:bool = false;
 }

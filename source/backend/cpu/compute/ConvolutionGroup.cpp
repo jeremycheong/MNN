@@ -15,8 +15,7 @@ namespace MNN {
 ConvolutionGroup::ConvolutionGroup(Backend *b, const std::vector<std::shared_ptr<Execution>> &subConvolution)
     : MNN::Execution(b) {
     mSubConvolution = subConvolution;
-    auto group      = subConvolution.size();
-    MNN_ASSERT(group > 1);
+    MNN_ASSERT(subConvolution.size() > 1);
 
     mInputRaw.reset(new Tensor(4));
     mInputUnit.reset(new Tensor(4, Tensor::CAFFE_C4));
@@ -73,28 +72,28 @@ ErrorCode ConvolutionGroup::onExecute(const std::vector<Tensor *> &inputs, const
     auto input           = inputs[0];
     auto output          = outputs[0];
     int batch            = input->buffer().dim[0].extent;
-    auto inputBatchSize  = input->width() * input->height() * ALIGN_UP4(input->channel());
-    auto outputBatchSize = output->width() * output->height() * ALIGN_UP4(output->channel());
+    auto core = static_cast<CPUBackend*>(backend())->functions();
+    auto inputBatchSize  = input->width() * input->height() * UP_DIV(input->channel(), core->pack) * core->pack;
+    auto outputBatchSize = output->width() * output->height() * UP_DIV(output->channel(), core->pack) * core->pack;
 
     for (int b = 0; b < batch; ++b) {
-        auto srcOrigin = input->host<float>() + b * inputBatchSize;
-        auto dstOrigin = output->host<float>() + b * outputBatchSize;
+        auto srcOrigin = input->host<uint8_t>() + b * inputBatchSize * core->bytes;
+        auto dstOrigin = output->host<uint8_t>() + b * outputBatchSize * core->bytes;
 
-        MNNUnpackC4(mInputRaw->host<float>(), srcOrigin, input->width() * input->height(), input->channel());
+        core->MNNUnpackCUnit(mInputRaw->host<float>(), (float*)srcOrigin, input->width() * input->height(), input->channel());
         int inputGroupSize   = input->width() * input->height() * input->channel() / mSubConvolution.size();
         int outputGroupSize  = output->width() * output->height() * output->channel() / mSubConvolution.size();
         int subInputChannel  = input->channel() / mSubConvolution.size();
         int subOutputChannel = output->channel() / mSubConvolution.size();
         for (int group = 0; group < mSubConvolution.size(); ++group) {
-            MNNPackC4(mInputUnit->host<float>(), mInputRaw->host<float>() + group * inputGroupSize,
+            core->MNNPackCUnit(mInputUnit->host<float>(), (const float*)(mInputRaw->host<uint8_t>() + group * inputGroupSize * core->bytes),
                       input->width() * input->height(), subInputChannel);
             mSubConvolution[group]->onExecute(mInputUnitWrap, mOutputUnitWrap);
-            MNNUnpackC4(mOutputRaw->host<float>() + group * outputGroupSize, mOutputUnit->host<float>(),
+            core->MNNUnpackCUnit((float*)(mOutputRaw->host<uint8_t>() + group * outputGroupSize * core->bytes), mOutputUnit->host<float>(),
                         output->width() * output->height(), subOutputChannel);
         }
-        MNNPackC4(dstOrigin, mOutputRaw->host<float>(), output->width() * output->height(), output->channel());
+        core->MNNPackCUnit((float*)dstOrigin, mOutputRaw->host<float>(), output->width() * output->height(), output->channel());
     }
-
     return NO_ERROR;
 }
 } // namespace MNN

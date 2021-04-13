@@ -8,6 +8,9 @@
 
 #include "MNN_generated.h"
 #include "OnnxExtraManager.hpp"
+#include "../../common/Global.hpp"
+#include "config.hpp"
+
 namespace MNN {
 namespace Express {
 
@@ -45,10 +48,9 @@ static EXPRP _transformConv3D(EXPRP expr) {
     int depth = weightShape[2];
     int kh    = weightShape[3];
     int kw    = weightShape[4];
-    
+
     std::unique_ptr<Convolution3DT> conv3d(new MNN::Convolution3DT);
-    
-    auto weightDataPtr = weight->readMap<float>();
+    const float* weightDataPtr = weight->readMap<float>();
     conv3d->weight.resize(weightInfo->size);
     ::memcpy(conv3d->weight.data(), weightDataPtr, weightInfo->size * sizeof(float));
     conv3d->bias.resize(co);
@@ -57,25 +59,21 @@ static EXPRP _transformConv3D(EXPRP expr) {
         auto biasDataPtr = inputs[2]->readMap<float>();
         ::memcpy(conv3d->bias.data(), biasDataPtr, co * sizeof(float));
     }
-    
+
     conv3d->common.reset(new MNN::Convolution3DCommonT);
-    auto common          = conv3d->common.get();
-    
+    auto common = conv3d->common.get();
+
     common->relu = common->relu6 = false;
-    common->outputCount = co;
-    common->inputCount = ci;
-    common->kernels = std::vector<int>({depth, kh, kw});
+    common->outputCount          = co;
+    common->inputCount           = ci;
+    common->kernels              = std::vector<int>({depth, kh, kw});
 
     const int attrSize = extraParam->attr()->size();
     for (int i = 0; i < attrSize; ++i) {
         auto attr       = extraParam->attr()->GetAs<Attribute>(i);
         const auto& key = attr->key()->str();
         if (key == "dilations") {
-            auto values = attr->list()->i()->data();
-            if (values[0] != 1 || values[1] != 1 || values[2] != 1) {
-                MNN_ERROR("conv3d not support dilation bigger than 1\n");
-                return nullptr;
-            }
+            auto values     = attr->list()->i()->data();
             common->dilates = std::vector<int>({values[0], values[1], values[2]});
         } else if (key == "group") {
             if (attr->i() != 1) {
@@ -83,23 +81,19 @@ static EXPRP _transformConv3D(EXPRP expr) {
                 return nullptr;
             }
         } else if (key == "strides") {
-            auto values = attr->list()->i()->data();
-            if (values[0] != 1 || values[1] != 1 || values[2] != 1) {
-                MNN_ERROR("conv3d not support strides bigger than 1\n");
-                return nullptr;
-            }
+            auto values     = attr->list()->i()->data();
             common->strides = std::vector<int>({values[0], values[1], values[2]});
         } else if (key == "pads") {
-            auto values = attr->list()->i()->data();
+            auto values     = attr->list()->i()->data();
             common->padMode = MNN::PadMode_CAFFE;
-            common->pads = std::vector<int>({values[0], values[1], values[2]});
+            common->pads    = std::vector<int>({values[0], values[1], values[2]});
         }
     }
 
     std::unique_ptr<OpT> newOp(new OpT);
-    newOp->name = expr->name();
-    newOp->type = OpType_Convolution3D;
-    newOp->main.type = OpParameter_Convolution3D;
+    newOp->name       = expr->name();
+    newOp->type       = OpType_Convolution3D;
+    newOp->main.type  = OpParameter_Convolution3D;
     newOp->main.value = conv3d.release();
 
     auto newExpr = Expr::create(newOp.get(), {inputs[0]}, 1);
@@ -135,21 +129,25 @@ public:
         int co = weightShape[0];
         int ci = weightShape[1];
         int kh = weightShape[2];
-        int kw = weightShape[3];
+        int kw = 1;
+        if (weightShape.size() >= 4) {
+            kw = weightShape[3];
+        }
 
         if (isDeconv) {
             co = weightShape[1];
             ci = weightShape[0];
         }
 
-        int group      = 1;
-        int dilation_h = 1;
-        int dilation_w = 1;
-        int stride_h   = 1;
-        int stride_w   = 1;
+        int group           = 1;
+        int dilation_h      = 1;
+        int dilation_w      = 1;
+        int stride_h        = 1;
+        int stride_w        = 1;
         PadMode modePadding = PadMode_CAFFE;
         std::vector<int> outputPadding;
         std::vector<int> inputPadding;
+        std::vector<int> outputShape;
 
         const int attrSize = extraParam->attr()->size();
         for (int i = 0; i < attrSize; ++i) {
@@ -168,8 +166,10 @@ public:
             } else if (key == "auto_pad") {
                 if (attr->s()->str() == "NOTSET") {
                     modePadding = PadMode_CAFFE;
-                } else if (attr->s()->str() == "SAME_UPPER") {
+                } else if (attr->s()->str() == "SAME_UPPER" || attr->s()->str() == "SAME_LOWER") {
                     modePadding = PadMode_SAME;
+                } else if (attr->s()->str() == "VALID") {
+                    modePadding = PadMode_VALID;
                 } else {
                     MNN_ERROR("Conv auto_pad not support %s\n", attr->s()->c_str());
                     return nullptr;
@@ -177,16 +177,31 @@ public:
             } else if (key == "pads") {
                 auto dataList = attr->list();
                 inputPadding.resize(dataList->i()->size());
-                for (int v=0; v<inputPadding.size(); v++) {
+                for (int v = 0; v < inputPadding.size(); v++) {
                     inputPadding[v] = dataList->i()->data()[v];
                 }
-            }else if (key == "output_padding"){
+                // Support Convolution 1D
+                if (inputPadding.size() == 2) {
+                    inputPadding = {inputPadding[0], 0, inputPadding[1], 0};
+                }
+            } else if (key == "output_padding") {
                 // only valid in ConvTranspose
-                auto dataList = attr->list();
+                auto dataList  = attr->list();
                 const int size = dataList->i()->size();
-                for(int k = 0; k < size; ++k){
+                for (int k = 0; k < size; ++k) {
                     outputPadding.push_back(dataList->i()->data()[k]);
                 }
+            } else if (key == "output_shape") {
+                auto dataList = attr->list();
+                outputShape.resize(dataList->i()->size());
+                for (int v = 0; v < outputShape.size(); v++) {
+                    outputShape[v] = dataList->i()->data()[v];
+                }
+            } else if (key == "kernel_shape") {
+                auto dataList = attr->list();
+                MNN_ASSERT(dataList->i()->size() == 2);
+                MNN_ASSERT(dataList->i()->data()[0] == kh);
+                MNN_ASSERT(dataList->i()->data()[1] == kw);
             }
         }
 
@@ -199,30 +214,53 @@ public:
             common->padY = inputPadding[0];
             common->padX = inputPadding[1];
         }
-        common->padMode     = modePadding;
+        common->padMode = modePadding;
 
         // set param
-        common->relu        = false;
-        common->group       = group;
+        common->relu  = false;
+        common->group = group;
         if (isDeconv) {
-            common->outputCount = co * group;//deconv set inputCount to be ci, dw to be group
-            common->inputCount  = ci;
+            common->outputCount = co * group; // deconv set inputCount to be ci, dw to be group
+            common->inputCount = ci;
         } else {
             common->outputCount = co;
             common->inputCount  = ci * group; // conv set inputCount to be ci, dw to be group
         }
-        common->kernelX     = kw;
-        common->kernelY     = kh;
-        common->dilateX     = dilation_w;
-        common->dilateY     = dilation_h;
-        common->strideX     = stride_w;
-        common->strideY     = stride_h;
-        common->pads = inputPadding;
-        
+        common->kernelX = kw;
+        common->kernelY = kh;
+        common->dilateX = dilation_w;
+        common->dilateY = dilation_h;
+        common->strideX = stride_w;
+        common->strideY = stride_h;
+        common->pads    = inputPadding;
+        common->outPads = outputPadding;
+        if (!outputShape.empty()) {
+            common->hasOutputShape = true;
+            common->padMode = PadMode_SAME;
+        }
+        auto config = Global<modelConfig>::Get();
         // read weight data
-        auto weightDataPtr = weight->readMap<float>();
+        const float* weightDataPtr = nullptr;
+        int limitNumber = 4;
+        if (config->optimizePrefer == 1) {
+            // Smallest
+            limitNumber = 1;
+        } else if (config->optimizePrefer == 2) {
+            // Fastest
+            limitNumber = 100;
+        }
+        if (weight->linkNumber() <= limitNumber) {
+            weightDataPtr = weight->readMap<float>();
+        }
         // weight is Constant node
         if (weightDataPtr) {
+            if (weight->linkNumber() > 1) {
+                static bool gPrint = false;
+                if (!gPrint) {
+                    MNN_PRINT("The Convolution use shared weight, may increase the model size\n");
+                    gPrint = true;
+                }
+            }
             const int weightSize = co * ci * kh * kw;
             convParam->weight.resize(weightSize);
             ::memcpy(convParam->weight.data(), weightDataPtr, weightSize * sizeof(float));
@@ -253,30 +291,47 @@ public:
 
         if (isDeconv) {
             newOp->type = OpType_Deconvolution;
+            if (group > 1 && group == ci * co) {
+                newOp->type = OpType_DeconvolutionDepthwise;
+            }
         } else {
             newOp->type = OpType_Convolution;
+            if (group > 1 && group == ci * co) {
+                newOp->type = OpType_ConvolutionDepthwise;
+            }
         }
 
         newOp->main.type  = OpParameter_Convolution2D;
         newOp->main.value = convParam.release();
-
-        auto x = _Convert(inputs[0], NC4HW4);
-        EXPRP convolutinExpr;
-        if (weightDataPtr) {
-            // merge weight(bias) node to Conv parameter
-            
-            auto realOutputExpr = Expr::create(newOp.get(), {x});
-            if(isDeconv && outputPadding.size() == 2){
-                // if output_padding is not empty, add Padding after deconv
-                std::vector<int> realOutputPadding(4 * 2);
-                realOutputPadding[2 * 2 + 1] = outputPadding[0];
-                realOutputPadding[3 * 2 + 1] = outputPadding[1];
-                auto padValue = _Const(realOutputPadding.data(), {8}, NCHW, halide_type_of<int>());
-                auto padInput = Variable::create(realOutputExpr);
-                auto padOutput = _Pad(padInput, padValue);
-                realOutputExpr = padOutput->expr().first;
+        auto x            = inputs[0];
+        bool needSqueeze  = false;
+        if (nullptr != x->getInfo()) {
+            if (x->getInfo()->dim.size() == 3) {
+                x           = _Unsqueeze(x, {3});
+                needSqueeze = true;
             }
-            convolutinExpr = realOutputExpr;
+        }
+        EXPRP convolutinExpr;
+        if (!outputShape.empty()) {
+            // [1, outputHeight, outputWidth, 1]
+            outputShape.insert(outputShape.begin(), 1);
+            outputShape.push_back(1);
+            auto output_shape = _Const(outputShape.data(), {4}, NHWC, halide_type_of<int>());
+            if (weightDataPtr) {
+                // merge weight(bias) node to Conv parameter
+                convolutinExpr = Expr::create(newOp.get(), {x, output_shape});
+            } else {
+                // construct bias input, because mnn runtime constrain that conv should have 3 inputs when weight is not
+                // Constant
+                if (inputs.size() > 2) {
+                    convolutinExpr = Expr::create(newOp.get(), {x, inputs[1], inputs[2], output_shape});
+                } else {
+                    convolutinExpr = Expr::create(newOp.get(), {x, inputs[1], output_shape});
+                }
+            }
+        } else if (weightDataPtr) {
+            // merge weight(bias) node to Conv parameter
+            convolutinExpr = Expr::create(newOp.get(), {x});
         } else {
             // construct bias input, because mnn runtime constrain that conv should have 3 inputs when weight is not
             // Constant
@@ -287,7 +342,10 @@ public:
             }
         }
         convolutinExpr->setName(expr->name());
-        auto res = _Convert(Variable::create(convolutinExpr), NCHW);
+        auto res = Variable::create(convolutinExpr);
+        if (needSqueeze) {
+            res = _Squeeze(res, {3});
+        }
         return res->expr().first;
     }
 };

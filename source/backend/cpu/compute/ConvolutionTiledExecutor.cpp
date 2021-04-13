@@ -6,245 +6,266 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#include "backend/cpu/compute/ConvolutionTiledExecutor.hpp"
+#include "ConvolutionTiledExecutor.hpp"
 #include <MNN/AutoTime.hpp>
 #include "backend/cpu/CPUBackend.hpp"
-#include "backend/cpu/compute/CommonOptFunction.h"
+#include "CommonOptFunction.h"
 #include "core/Concurrency.h"
-#include "backend/cpu/compute/ConvOpt.h"
+#include "ConvOpt.h"
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
-#include "math/Vec4.hpp"
+#include "math/Vec.hpp"
+#include "core/BufferAllocator.hpp"
 
+using Vec4 = MNN::Math::Vec<float, 4>;
 namespace MNN {
-ErrorCode ConvolutionTiledExecutorMultiInput::onExecute(const std::vector<Tensor*>& inputs,
-                                                        const std::vector<Tensor*>& outputs) {
-    int depth       = inputs[1]->channel();
-    int outputCount = inputs[1]->batch();
-    ::memset(mTempWeight->host<float>(), 0, mTempWeight->size());
-    if (nullptr != mTempBias) {
-        ::memset(mTempBias->host<float>(), 0, mTempBias->size());
-        if (inputs.size() > 2) {
-            ::memcpy(mTempBias->host<float>(), inputs[2]->host<float>(), inputs[2]->size());
-        }
+static void _initWeight(float *dest, const float *source, float* cache, int depth, int outputCount, int kernelSize, const CoreFunctions* function) {
+    // Swap k, ic
+    int dims[4] = {
+        depth,
+        kernelSize,
+        kernelSize,
+        depth
+    };
+    for (int o=0; o<outputCount; ++o) {
+        auto dO = cache + o * depth * kernelSize;
+        auto sO = source + o * depth * kernelSize;
+        MNNTranspose32Bit((int32_t*)dO, (const int32_t*)sO, &dims[0]);
     }
-    CPUConvolution::reorderWeight(mTempWeight->host<float>(), inputs[1]->host<float>(), depth, outputCount,
-                                  inputs[1]->width() * inputs[1]->height(), mTempWeightCache->host<float>());
-    return mProxy->onExecute(mInputs, outputs);
+    if (function->bytes < 4) {
+        // Lowp
+        function->MNNFp32ToLowp((float*)cache, (int16_t*)cache, outputCount * kernelSize * depth);
+    }
+    function->MNNPackForMatMul_B(dest, cache, outputCount, kernelSize * depth, true);
 }
-ErrorCode ConvolutionTiledExecutorMultiInput::onResize(const std::vector<Tensor*>& inputs,
-                                                       const std::vector<Tensor*>& outputs) {
-    int depth       = inputs[1]->channel();
-    int outputCount = outputs[0]->channel();
-    mTempWeight.reset(Tensor::createDevice<float>(
-        {UP_DIV(outputCount, 4), UP_DIV(depth, 4), inputs[1]->width() * inputs[1]->height(), 16}));
-    mTempWeightCache.reset(Tensor::createDevice<float>(
-        {UP_DIV(outputCount, 4), UP_DIV(depth, 4), inputs[1]->width() * inputs[1]->height(), 16}));
-    backend()->onAcquireBuffer(mTempWeight.get(), Backend::DYNAMIC);
-    backend()->onAcquireBuffer(mTempWeightCache.get(), Backend::DYNAMIC);
-    mTempBias.reset();
-    if (inputs.size() > 2 && inputs[2]->elementSize() % 4 == 0) {
-        mInputs = {inputs[0], mTempWeight.get(), inputs[2]};
-    } else {
-        mTempBias.reset(Tensor::createDevice<float>({ALIGN_UP4(outputCount)}));
-        backend()->onAcquireBuffer(mTempBias.get(), Backend::DYNAMIC);
-        mInputs = {inputs[0], mTempWeight.get(), mTempBias.get()};
-    }
-    backend()->onReleaseBuffer(mTempWeightCache.get(), Backend::DYNAMIC);
-    auto errorCode = mProxy->onResize(mInputs, outputs);
-    backend()->onReleaseBuffer(mTempWeight.get(), Backend::DYNAMIC);
-    if (nullptr != mTempBias) {
-        backend()->onReleaseBuffer(mTempBias.get(), Backend::DYNAMIC);
-    }
-    return errorCode;
-}
-
 ConvolutionTiledExecutor::ConvolutionTiledExecutor(const Convolution2DCommon* common, Backend* b,
                                                    const float* originWeight, size_t originWeightSize,
                                                    const float* bias, size_t biasSize)
     : MNN::Execution(b) {
     auto outputCount = (int)biasSize;
-    // TODO, use common->inputCount to get srcCount
+    mResource.reset(new CPUConvolution::Resource);
+    mResource->backend = b;
+    int eP, lP, hP;
+    auto core = static_cast<CPUBackend*>(b)->functions();
+    int bytes = core->bytes;
+    core->MNNGetMatMulPackMode(&eP, &lP, &hP);
+    // Don't use common->inputCount for old model common->inputCount is zero
     auto srcCount    = (int)originWeightSize / outputCount / common->kernelX() / common->kernelY();
-    mWeight.reset(Tensor::createDevice<float>(
-        {UP_DIV(outputCount, 4), UP_DIV(srcCount, 4), (int)common->kernelX(), common->kernelY(), 16}));
-    std::shared_ptr<Tensor> tempWeight(Tensor::createDevice<float>(
-        {UP_DIV(outputCount, 4), UP_DIV(srcCount, 4), (int)common->kernelX(), common->kernelY(), 16}));
-    mValid = backend()->onAcquireBuffer(mWeight.get(), Backend::STATIC) &&
-             backend()->onAcquireBuffer(tempWeight.get(), Backend::STATIC);
+    auto lSize = srcCount * common->kernelX() * common->kernelY();
+    mResource->mWeight.reset(Tensor::createDevice<uint8_t>(
+        {UP_DIV(outputCount, hP) * UP_DIV(lSize, lP) * hP * lP * bytes}));
+    std::shared_ptr<Tensor> cache(Tensor::createDevice<uint8_t>({outputCount * srcCount * common->kernelX() * common->kernelY() * (int)sizeof(float)})); // cache must be float
+    mValid = backend()->onAcquireBuffer(mResource->mWeight.get(), Backend::STATIC) && backend()->onAcquireBuffer(cache.get(), Backend::STATIC);
     if (!mValid) {
         return;
     }
-
-    CPUConvolution::reorderWeight(mWeight->host<float>(), originWeight, srcCount, outputCount,
-                                  common->kernelX() * common->kernelY(), tempWeight->host<float>());
-    backend()->onReleaseBuffer(tempWeight.get(), Backend::STATIC);
-    mBias.reset(Tensor::createDevice<float>({ALIGN_UP4((int)biasSize)}));
-    mValid = backend()->onAcquireBuffer(mBias.get(), Backend::STATIC);
+    _initWeight(mResource->mWeight->host<float>(), originWeight, cache->host<float>(), srcCount, outputCount, common->kernelX() * common->kernelY(), core);
+    backend()->onReleaseBuffer(cache.get(), Backend::STATIC);
+    mValid = mResource->copyBiasAlign(bias, biasSize);
     if (!mValid) {
         return;
     }
-    ::memset(mBias->host<float>(), 0, mBias->size());
-    ::memcpy(mBias->host<float>(), bias, biasSize * sizeof(float));
     mProxy.reset(new ConvolutionTiledExecutorBasic(common, b));
 }
-ConvolutionTiledExecutor::~ConvolutionTiledExecutor() {
-    if (nullptr != mBias) {
-        backend()->onReleaseBuffer(mBias.get(), Backend::STATIC);
-    }
-    if (nullptr != mWeight) {
-        backend()->onReleaseBuffer(mWeight.get(), Backend::STATIC);
-    }
+
+ConvolutionTiledExecutor::ConvolutionTiledExecutor(std::shared_ptr<CPUConvolution::Resource> res, const Convolution2DCommon* common, Backend* b) : Execution(b) {
+    mResource = res;
+    mProxy.reset(new ConvolutionTiledExecutorBasic(common, b));
 }
+
+ConvolutionTiledExecutor::~ConvolutionTiledExecutor() {
+    // Do nothing
+}
+bool ConvolutionTiledExecutor::onClone(Backend* bn, const Op* op, Execution** dst) {
+    if (!mValid) {
+        return false;
+    }
+    if (nullptr == dst) {
+        return true;
+    }
+    *dst = new ConvolutionTiledExecutor(mResource, op->main_as_Convolution2D()->common(), bn);
+    return true;
+}
+
 ErrorCode ConvolutionTiledExecutorBasic::onResize(const std::vector<Tensor*>& inputs,
                                                   const std::vector<Tensor*>& outputs) {
-    MNN_ASSERT(3 == inputs.size());
     CPUConvolution::onResize(inputs, outputs);
-    auto layer  = mCommon;
     auto input  = inputs[0];
     auto weight = inputs[1];
-    auto bias   = inputs[2];
-    auto output = outputs[0];
-    mFunctions.clear();
-    CONV_SETUP_KERNELSIZE(4);
-    auto dst_depth_quad = UP_DIV(output->channel(), 4);
-    int threadNumber    = ((CPUBackend*)backend())->threadNumber();
-    auto postFunction   = getPostFunction();
-    auto biasPtr        = bias->host<float>();
-    auto weightPtr      = weight->host<float>();
-    auto weight_z_step  = kernel_height * kernel_width * src_depth_quad * 16;
-    auto weight_sy_step = kernel_width * 16;
-    auto weight_sz_step = kernel_width * kernel_height * 16;
-    int strideX_step    = strideX * 4;
-    int src_z_step      = input->width() * input->height() * 4;
-
-    if (width * height <= CONVOLUTION_TILED_NUMBER * 4 || dst_depth_quad < 4 || src_depth_quad < 4) {
-        // Use Slice Window
-        threadNumber                      = std::min(dst_depth_quad, threadNumber);
-        std::function<void(int)> function = [=](int tId) {
-            for (int batchIndex = 0; batchIndex < input->batch(); ++batchIndex) {
-                auto dstOrigin = output->host<float>() + batchIndex * output->stride(0);
-                auto srcOrigin = input->host<float>() + batchIndex * input->stride(0);
-                for (int dz = tId; dz < dst_depth_quad; dz += threadNumber) {
-                    float* dst_z     = dstOrigin + dz * width * height * 4;
-                    float* bias_z    = biasPtr + 4 * dz;
-                    float* weight_dz = weightPtr + dz * weight_z_step;
-                    int dx, dy;
-                    // Compute Border
-                    CONVOLUVTION_RUN_BASIC(0, 0, width, t, float, nullptr);
-                    CONVOLUVTION_RUN_BASIC(0, b, width, height, float, nullptr);
-                    CONVOLUVTION_RUN_BASIC(0, t, l, b, float, nullptr);
-                    CONVOLUVTION_RUN_BASIC(r, t, width, b, float, nullptr);
-
-                    if (r > l && b > t) {
-                        // Compute Mid
-                        for (dy = t; dy < b; ++dy) {
-                            int srcStartY = dy * strideY - padY;
-                            float* dst_y  = dst_z + width * 4 * dy;
-                            float* src_dy = srcOrigin + srcStartY * src_width * 4;
-                            MNNConvSlideWindowMiddle(dst_y + l * 4, src_dy + (l * strideX - padX) * 4, weight_dz, r - l,
-                                                     strideX_step, src_depth_quad, src_z_step, kernel_width,
-                                                     kernel_height, dilateX_step, dilateY_step, nullptr);
-                        }
-                    }
-                    postFunction(dst_z, bias_z, width * height, 1);
-                }
-            }
-        };
-        mFunctions.emplace_back(std::make_pair(std::min(dst_depth_quad, threadNumber), std::move(function)));
-        return NO_ERROR;
+    Tensor* bias = nullptr;
+    auto core = static_cast<CPUBackend*>(backend())->functions();
+    int bytes = core->bytes;
+    int unit = core->pack;
+    auto packA = core->MNNPackC4ForMatMul_A;
+    auto matmulUnit = core->MNNPackedMatMul;
+    auto matmulRemain = core->MNNPackedMatMulRemain;
+    int eP, lP, hP;
+    core->MNNGetMatMulPackMode(&eP, &lP, &hP);
+    const float* biasPtr = nullptr;
+    if (inputs.size() > 2) {
+        bias   = inputs[2];
+        biasPtr        = bias->host<float>();
     }
-    auto& tempBuffer = mTempBuffer.buffer();
-    auto icC4 = UP_DIV(input->channel(), 4);
-    auto ocC4 = UP_DIV(output->channel(), 4);
+    auto output = outputs[0];
+    auto width = output->width();
+    auto height = output->height();
+    int threadNumber    = ((CPUBackend*)backend())->threadNumber();
+    auto weightPtr      = weight->host<float>();
+    auto src_width = input->width();
+    auto src_height = input->height();
+    int src_z_step      = input->width() * input->height() * unit;
+    auto CONVOLUTION_TILED_NUMBER = eP;
+    auto icC4 = UP_DIV(input->channel(), unit);
+    auto ic = input->channel();
+    auto L = ic * mCommon->kernelY() * mCommon->kernelX();
+    auto kernelSize = mCommon->kernelX() * mCommon->kernelY();
 
-    tempBuffer.dim[0].extent = threadNumber;
-    tempBuffer.dim[1].extent = CONVOLUTION_TILED_NUMBER;
-    tempBuffer.dim[2].extent = icC4 * mCommon->kernelY() * mCommon->kernelX(); // srcCount/4 * kx*ky
-    tempBuffer.dim[3].extent = 4;
-    TensorUtils::setLinearLayout(&mTempBuffer);
+    mTempBufferTranspose.buffer().type = halide_type_of<uint8_t>();
+    mTempBufferTranspose.buffer().dimensions = 2;
+    mTempBufferTranspose.buffer().dim[0].extent = threadNumber;
+    mTempBufferTranspose.buffer().dim[1].extent = UP_DIV(L, lP) * lP * CONVOLUTION_TILED_NUMBER * bytes;
+    TensorUtils::setLinearLayout(&mTempBufferTranspose);
 
-    bool success = backend()->onAcquireBuffer(&mTempBuffer, Backend::DYNAMIC);
+    int tileCount = UP_DIV(width*height, CONVOLUTION_TILED_NUMBER);
+    int plane = width * height;
+
+    bool success = backend()->onAcquireBuffer(&mTempBufferTranspose, Backend::DYNAMIC);
     if (!success) {
         return OUT_OF_MEMORY;
     }
-    backend()->onReleaseBuffer(&mTempBuffer, Backend::DYNAMIC);
+    auto outputChannel = output->channel();
+    auto oC4 = UP_DIV(outputChannel, unit);
+    auto bufferAlloc = static_cast<CPUBackend*>(backend())->getBufferAllocator();
+    auto maxLine = UP_DIV(CONVOLUTION_TILED_NUMBER, width) + 1;
+    auto tempPtr = bufferAlloc->alloc(kernelSize * maxLine * threadNumber * (4 * sizeof(int32_t) + sizeof(float*)));
+    if (nullptr == tempPtr.first) {
+        return OUT_OF_MEMORY;
+    }
+    backend()->onReleaseBuffer(&mTempBufferTranspose, Backend::DYNAMIC);
+    bufferAlloc->free(tempPtr);
+    std::vector<size_t> parameters(6);
+    parameters[0] = eP * bytes;
+    parameters[1] = L;
+    parameters[2] = outputChannel;
+    parameters[3] = plane * unit * bytes;
+    parameters[4] = 0;
+    parameters[5] = 0;
+    auto threadNumberFirst = std::min(threadNumber, tileCount);
+    auto postParameters = getPostParameters();
+    mFunction.first = threadNumberFirst;
+    auto strideX = mCommon->strideX();
+    auto strideY = mCommon->strideY();
+    auto dilateX = mCommon->dilateX();
+    auto dilateY = mCommon->dilateY();
+    auto padY = mPadY;
+    auto padX = mPadX;
+    auto kernel_width = mCommon->kernelX();
+    auto kernel_height = mCommon->kernelY();
+    if (src_width == 1 && width == 1 && height > 1) {
+        // Swap x, y
+        width = height;
+        height = 1;
+        padX = mPadY;
+        padY = mPadX;
+        strideX = strideY;
+        strideY = 1;// Don't need stride
+        src_width = src_height;
+        src_height = 1;
+        dilateX = dilateY;
+        dilateY = 1;
+        kernel_width = kernel_height;
+        kernel_height = 1;
+    }
 
-    int count                             = UP_DIV(width*height, CONVOLUTION_TILED_NUMBER);
-    int plane = width * height;
-    auto threadNumberFirst                 = std::min(threadNumber, count);
-    std::function<void(int)> firstFunction = [=](int tId) {
-        auto colBuffer = mTempBuffer.host<float>() + mTempBuffer.stride(0) * tId;
+    auto outputBatchStride = width * height * oC4 * unit;
+    auto inputBatchStride = src_width * src_height * icC4 * unit;
+    mFunction.second = [=](int tId) {
+        auto gemmBuffer = mTempBufferTranspose.host<uint8_t>() + mTempBufferTranspose.stride(0) * tId;
+        auto srcPtr = (float const**)((uint8_t*)tempPtr.first + tempPtr.second + tId * kernelSize * maxLine * (4 * sizeof(int32_t) + sizeof(float*)));
+        auto el = (int32_t*)(srcPtr + kernelSize * maxLine);
+
+        int32_t info[4];
+        info[1] = src_width * src_height;
+        info[2] = eP;
+        info[3] = strideX;
         for (int batchIndex = 0; batchIndex < input->batch(); ++batchIndex) {
-            auto dstOrigin = output->host<float>() + batchIndex * output->stride(0);
-            auto srcOrigin = input->host<float>() + batchIndex * input->stride(0);
+            auto dstOrigin = output->host<uint8_t>() + batchIndex * outputBatchStride * bytes;
+            auto srcOrigin = input->host<uint8_t>() + batchIndex * inputBatchStride * bytes;
 
-            for (int x = (int)tId; x < count; x += threadNumberFirst) {
+            for (int x = (int)tId; x < tileCount; x += threadNumberFirst) {
                 int start    = (int)x * CONVOLUTION_TILED_NUMBER;
                 int remain   = plane - start;
                 int xC        = remain > CONVOLUTION_TILED_NUMBER ? CONVOLUTION_TILED_NUMBER : remain;
-                // Im2Col
-                ::memset(colBuffer, 0, mTempBuffer.stride(0) * sizeof(float));
-                for (int i = 0; i<xC; ++i) {
-                    int index = start + i;
-                    int ox = index % width;
-                    int oy = index / width;
-                    int sxSta = ox * strideX - padX;
+                // Compute Pack position
+                int oyBegin = start / width;
+                int oxBegin = start % width;
+                int oyEnd = (start + xC-1) / width;
+                remain = xC;
+                int number = 0;
+                bool needZero = false;
+                int eStart = 0;
+                for (int oy=oyBegin; oy <= oyEnd; ++oy) {
+                    int step = std::min(width - oxBegin, remain);
                     int sySta = oy * strideY - padY;
-                    for (int ky=0; ky<kernel_height; ++ky) {
-                        auto sy = sySta + ky * dilateY;
-                        if (sy < 0 || sy >= src_height) {
-                            continue;
-                        }
-                        for (int kx=0; kx<kernel_width; ++kx) {
-                            auto sx = sxSta + kx * dilateX;
-                            if (sx < 0 || sx >= src_width) {
-                                continue;
+                    int kyStart = std::max(0, UP_DIV(-sySta, dilateY));
+                    int kyEnd = std::min(kernel_height, UP_DIV(src_height - sySta, dilateY));
+                    if (kyEnd - kyStart < kernel_height) {
+                        needZero = true;
+                    }
+                    for (int ky=kyStart; ky < kyEnd; ++ky) {
+                        auto lKYOffset = ky * kernel_width * ic;
+                        auto srcKy = srcOrigin + (sySta + ky * dilateY) * src_width * bytes * unit;
+                        for (int kx=0; kx<kernel_width;++kx) {
+                            // Compute x range:
+                            // 0 <= (oxBegin + x) * strideX - padX + dilateX * kx < src_width
+                            // 0 <= x <= step
+                            int end = std::min(step, (src_width - oxBegin * strideX - dilateX * kx + padX + strideX - 1) / strideX);
+                            int sta = std::max(0, UP_DIV((padX - oxBegin*strideX - dilateX * kx), strideX));
+                            if (end - sta < step) {
+                                needZero = true;
                             }
-                            auto src = srcOrigin + sx * 4 + sy * 4 * src_width;
-                            auto dst = colBuffer + i * 4 + 4 * xC * (kx + ky*kernel_width);
-                            for (int sz=0; sz<icC4; ++sz) {
-                                Math::Vec4::save(dst + 4 * xC * kernel_height * kernel_width * sz, Math::Vec4::load(src + src_z_step * sz));
+                            if (end > sta) {
+                                auto lOffset = lKYOffset + (kx * ic);
+                                auto srcKx = srcKy + ((oxBegin + sta) * strideX + dilateX * kx - padX) * bytes * unit;
+                                srcPtr[number] = (const float*)srcKx;
+                                el[4 * number + 0] = end - sta;
+                                el[4 * number + 1] = ic;
+                                el[4 * number + 2] = eStart + sta;
+                                el[4 * number + 3] = lOffset;
+                                number++;
                             }
                         }
                     }
+                    oxBegin = 0;
+                    remain -= step;
+                    eStart += step;
                 }
+                info[0] = number;
+                if (needZero || lP != 1) {
+                    ::memset(gemmBuffer, 0, mTempBufferTranspose.stride(0));
+                }
+                if (number > 0) {
+                    packA((float*)gemmBuffer, srcPtr, info, el);
+                }
+
                 // GEMM
                 if (xC == CONVOLUTION_TILED_NUMBER) {
-                    MNNGemmFloatUnit_4(dstOrigin + start * 4, colBuffer,
-                                        weightPtr, icC4 * kernel_width * kernel_height, width * height * 4, ocC4, 0);
+                    matmulUnit((float*)(dstOrigin + start * unit * bytes), (float*)gemmBuffer, weightPtr, parameters.data(), postParameters.data(), biasPtr);
                 } else {
-                    MNNGemmFloatCommon_4(dstOrigin + start * 4, colBuffer,
-                                        weightPtr, icC4 * kernel_width * kernel_height, width * height * 4, ocC4, xC, 0);
+                    matmulRemain((float*)(dstOrigin + start * unit * bytes), (float*)gemmBuffer, weightPtr, xC, parameters.data(), postParameters.data(), biasPtr);
                 }
             }
         }
     };
-    mFunctions.emplace_back(std::make_pair(threadNumberFirst, firstFunction));
-    int threadNumberSecond                  = std::min(threadNumber, dst_depth_quad);
-    std::function<void(int)> secondFunction = [biasPtr, width, height, dst_depth_quad, output, postFunction,
-                                               threadNumberSecond](int tId) {
-        for (int batchIndex = 0; batchIndex < output->batch(); ++batchIndex) {
-            auto dstOrigin = output->host<float>() + batchIndex * output->stride(0);
-            for (int dz = tId; dz < dst_depth_quad; dz += threadNumberSecond) {
-                float* dst_z  = dstOrigin + dz * width * height * 4;
-                float* bias_z = biasPtr + 4 * dz;
-                postFunction(dst_z, bias_z, width * height, 1);
-            }
-        }
-    };
-    mFunctions.emplace_back(std::make_pair(threadNumberSecond, secondFunction));
     return NO_ERROR;
 }
 
 ErrorCode ConvolutionTiledExecutorBasic::onExecute(const std::vector<Tensor*>& inputs,
                                                    const std::vector<Tensor*>& outputs) {
-    for (auto& iter : mFunctions) {
-        MNN_CONCURRENCY_BEGIN(tId, iter.first) {
-            iter.second((int)tId);
-        }
-        MNN_CONCURRENCY_END();
+    MNN_CONCURRENCY_BEGIN(tId, mFunction.first) {
+        mFunction.second((int)tId);
     }
+    MNN_CONCURRENCY_END();
     return NO_ERROR;
 }
 } // namespace MNN

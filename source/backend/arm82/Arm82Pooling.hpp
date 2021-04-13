@@ -5,12 +5,13 @@
 //  Created by MNN on 2020/01/08.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
+#if defined(__ANDROID__) || defined(__aarch64__)
 
 #ifndef Arm82Pooling_hpp
 #define Arm82Pooling_hpp
 
 #include "MNN_generated.h"
-#include "backend/arm82/Arm82Backend.hpp"
+#include "Arm82Backend.hpp"
 #include "core/Execution.hpp"
 
 namespace MNN {
@@ -29,4 +30,5 @@ private:
 
 } // namespace MNN
 
+#endif
 #endif

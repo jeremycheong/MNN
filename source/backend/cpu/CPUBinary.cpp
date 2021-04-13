@@ -7,14 +7,13 @@
 //
 
 #include "CPUBinary.hpp"
-#include <math.h>
-#include <algorithm>
 #include "CPUBackend.hpp"
 #include "compute/CommonOptFunction.h"
 #include "compute/ConvOpt.h"
 #include "core/Macro.h"
 #include "core/Concurrency.h"
 #include "core/OpCommonUtils.hpp"
+#include "BinaryUtils.hpp"
 namespace MNN {
 #define MAX_DIM 6
 CPUBinaryInt::CPUBinaryInt(Backend* b, int32_t type) : MNN::Execution(b), mType(type) {
@@ -199,133 +198,16 @@ static ErrorCode _binaryOp(Tensor* input0, Tensor* input1, Tensor* output) {
     return NO_ERROR;
 }
 
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryMax : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return std::max(x, y);
-    }
-};
 
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryMin : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return std::min(x, y);
-    }
-};
 
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryMul : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return x * y;
+static void callEleFunc(void(*proc)(float* C, const float* A, const float* B, size_t width, size_t cStride, size_t aStride, size_t bStride, size_t height),
+                        float* C, const float* A, const float* B, size_t size, bool swap) {
+    if (swap) {
+        proc(C, B, A, size, 0, 0, 0, 1);
+    } else {
+        proc(C, A, B, size, 0, 0, 0, 1);
     }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryAdd : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return x + y;
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinarySub : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return x - y;
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryRealDiv : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return x / y;
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryMod : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return x - x / y;
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryGreater : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return (_ErrorCode)((x > y) ? 1 : 0);
-    }
-};
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryLess : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return (_ErrorCode)((x < y) ? 1 : 0);
-    }
-};
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryGreaterEqual : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return (_ErrorCode)((x >= y) ? 1 : 0);
-    }
-};
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryLessEqual : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return (_ErrorCode)((x <= y) ? 1 : 0);
-    }
-};
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryEqual : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return (_ErrorCode)((x == y) ? 1 : 0);
-    }
-};
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryFloorDiv : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return floor(x / y);
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryFloorMod : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return x - floor(x / y) * y;
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinarySquaredDifference : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return (x - y) * (x - y);
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryPow : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return pow(x, y);
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryAtan2 : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return atan(x / y);
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryLogicalOr : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return (_ErrorCode)((x || y) ? 1 : 0);
-    }
-};
-
-template <typename _Arg1, typename _Arg2, typename _ErrorCode>
-struct BinaryNotEqual : std::binary_function<_Arg1, _Arg2, _ErrorCode> {
-    _ErrorCode operator()(const _Arg1& x, const _Arg2& y) const {
-        return (_ErrorCode)((x != y) ? 1 : 0);
-    }
-};
+}
 
 ErrorCode CPUBinaryFloat::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     auto input  = inputs[0];
@@ -365,7 +247,7 @@ ErrorCode CPUBinaryFloat::onExecute(const std::vector<Tensor*>& inputs, const st
             } else {
                 MNN_CONCURRENCY_BEGIN(tId, numberThread) {
                     for (int y = tId; y < mOutside; y+=numberThread) {
-                        mElementProc(output->host<float>() + y * mAxis, input->host<float>() + y * mAxis, input1->host<float>(), mAxis, 0, 0, 0, 1);
+                        callEleFunc(mElementProc, output->host<float>() + y * mAxis, input->host<float>() + y * mAxis, input1->host<float>(), mAxis, swap);
                     }
                 }
                 MNN_CONCURRENCY_END();
@@ -410,7 +292,7 @@ ErrorCode CPUBinaryFloat::onExecute(const std::vector<Tensor*>& inputs, const st
                 float* input1Ptr = input1->host<float>();
                 auto total = mOutside * mAxis;
                 MNN_CONCURRENCY_BEGIN(tId, numberThread) {
-                    for (int index = tId; index < total; index += numberThread) {
+                    for (int index = (int)tId; index < total; index += numberThread) {
                         auto axis = index % mAxis;
                         float scalar = input1Ptr[axis];
                         float scale = scalar;
@@ -466,16 +348,16 @@ ErrorCode CPUBinaryFloat::onExecute(const std::vector<Tensor*>& inputs, const st
             _binaryOp<float, int32_t, BinaryGreater<float, float, int32_t>>(input, input1, output);
             break;
         case BinaryOpOperation_LESS:
-            _binaryOp<float, float, BinaryLess<float, float, int32_t>>(input, input1, output);
+            _binaryOp<float, int32_t, BinaryLess<float, float, int32_t>>(input, input1, output);
             break;
         case BinaryOpOperation_LESS_EQUAL:
-            _binaryOp<float, float, BinaryLessEqual<float, float, int32_t>>(input, input1, output);
+            _binaryOp<float, int32_t, BinaryLessEqual<float, float, int32_t>>(input, input1, output);
             break;
         case BinaryOpOperation_GREATER_EQUAL:
-            _binaryOp<float, float, BinaryGreaterEqual<float, float, int32_t>>(input, input1, output);
+            _binaryOp<float, int32_t, BinaryGreaterEqual<float, float, int32_t>>(input, input1, output);
             break;
         case BinaryOpOperation_EQUAL:
-            _binaryOp<float, float, BinaryEqual<float, float, int32_t>>(input, input1, output);
+            _binaryOp<float, int32_t, BinaryEqual<float, float, int32_t>>(input, input1, output);
             break;
         case BinaryOpOperation_FLOORDIV:
             _binaryOp<float, float, BinaryFloorDiv<float, float, float>>(input, input1, output);
@@ -493,7 +375,7 @@ ErrorCode CPUBinaryFloat::onExecute(const std::vector<Tensor*>& inputs, const st
             _binaryOp<float, float, BinaryAtan2<float, float, float>>(input, input1, output);
             break;
         case BinaryOpOperation_NOTEQUAL:
-            _binaryOp<float, float, BinaryNotEqual<float, float, float>>(input, input1, output);
+            _binaryOp<float, int32_t, BinaryNotEqual<float, float, int32_t>>(input, input1, output);
             break;
         case BinaryOpOperation_MOD:
             _binaryOp<float, float, BinaryMod<float, float, float>>(input, input1, output);
@@ -573,16 +455,19 @@ class CPUBinaryCreator : public CPUBackend::Creator {
 public:
     virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                 const MNN::Op* op, Backend* backend) const override {
-        auto dataType   = outputs[0]->getType();
+        // auto dataType   = outputs[0]->getType();
         int32_t type = op->main_as_BinaryOp()->opType();
+        // auto dataType = op->main_as_BinaryOp()->T();
+        auto dataType = inputs[0]->getType();
         if (dataType.bits == 32) {
             if (dataType.code == halide_type_int) {
                 return new CPUBinaryInt(backend, type);
-            }
-            if (dataType.code == halide_type_float) {
+            } else if (dataType.code == halide_type_float) {
                 return new CPUBinaryFloat(backend, type);
             }
         }
+        MNN_ERROR("CpuBinary: unsupported data type (bits: %d, code: %d)\n",
+                  dataType.bits, dataType.code);
         return nullptr;
     }
 };
